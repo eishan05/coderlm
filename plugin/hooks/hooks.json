@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "Use the coderlm skill for all code navigation in supported languages (Rust, Python, TypeScript, JavaScript, Go). Use Read only for config files, markdown, and unsupported languages.",
+            "prompt": "Use the coderlm skill for all code navigation in supported languages (Rust, Python, TypeScript, JavaScript, Go). Use Read only for config files, markdown, and unsupported languages. Do not use Explore, Find, or Grep.",
             "description": "Reinforce coderlm as primary navigation tool"
           }
         ]

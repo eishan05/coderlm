@@ -16,13 +16,36 @@ pub fn extract_symbols_from_file(
     rel_path: &str,
     language: Language,
 ) -> Result<Vec<Symbol>> {
+    let abs_path = root.join(rel_path);
+    let source = std::fs::read_to_string(&abs_path)?;
+    extract_symbols_from_source(&source, rel_path, language)
+}
+
+/// Extract symbols from a single file, also returning its content hash.
+/// This reads the file once and computes the SHA-256 hash from the same bytes,
+/// avoiding TOCTOU races between parsing and hashing.
+pub fn extract_symbols_from_file_with_hash(
+    root: &Path,
+    rel_path: &str,
+    language: Language,
+) -> Result<(Vec<Symbol>, String)> {
+    let abs_path = root.join(rel_path);
+    let source = std::fs::read_to_string(&abs_path)?;
+    let content_hash = crate::cache::content_hash::hash_bytes(source.as_bytes());
+    let symbols = extract_symbols_from_source(&source, rel_path, language)?;
+    Ok((symbols, content_hash))
+}
+
+/// Extract symbols from source code string.
+fn extract_symbols_from_source(
+    source: &str,
+    rel_path: &str,
+    language: Language,
+) -> Result<Vec<Symbol>> {
     let config = match queries::get_language_config(language) {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
-
-    let abs_path = root.join(rel_path);
-    let source = std::fs::read_to_string(&abs_path)?;
 
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&config.language)?;
@@ -310,15 +333,18 @@ pub async fn extract_all_symbols_cached(
             // Try cache first: extract mtime+size from file tree entry
             // (drop the DashMap guard before taking any write locks)
             let file_meta = file_tree.files.get(&rel_path)
-                .map(|entry| (entry.modified.timestamp(), entry.size as i64));
+                .map(|entry| (entry.modified.timestamp_millis(), entry.size as i64));
 
             if let (Some(cache), Some((mtime, file_size))) = (&cache, file_meta) {
                 if let Ok(true) = cache.is_file_unchanged(&workspace_id, &rel_path, mtime, file_size) {
                     // mtime+size match — try to load from content hash
                     if let Ok(Some(manifest_entry)) = cache.get_manifest_entry(&workspace_id, &rel_path) {
-                        if let Ok(Some(symbols)) = cache.lookup_symbols(&manifest_entry.content_hash) {
+                        if let Ok(Some(symbols)) = cache.lookup_symbols(&manifest_entry.content_hash, language) {
                             let count = symbols.len();
-                            for sym in symbols {
+                            for mut sym in symbols {
+                                // Fix file path: cached symbols may have been
+                                // stored from a different workspace path
+                                sym.file = rel_path.clone();
                                 symbol_table.insert(sym);
                             }
                             if let Some(mut fe) = file_tree.files.get_mut(&rel_path) {
@@ -332,28 +358,35 @@ pub async fn extract_all_symbols_cached(
                 }
             }
 
-            // Cache miss or no cache — extract normally
-            match extract_symbols_from_file(&root, &rel_path, language) {
-                Ok(symbols) => {
+            // Cache miss or no cache — extract normally.
+            // Use extract_symbols_from_file_with_hash when caching is enabled
+            // to hash the exact bytes that were parsed (avoids TOCTOU race).
+            let extraction_result = if cache.is_some() {
+                extract_symbols_from_file_with_hash(&root, &rel_path, language)
+                    .map(|(syms, hash)| (syms, Some(hash)))
+            } else {
+                extract_symbols_from_file(&root, &rel_path, language)
+                    .map(|syms| (syms, None))
+            };
+
+            match extraction_result {
+                Ok((symbols, content_hash)) => {
                     let count = symbols.len();
 
                     // Store in cache if available
-                    if let Some(ref cache) = cache {
-                        let abs_path = root.join(&rel_path);
-                        if let Ok(content_hash) = crate::cache::content_hash::hash_file(&abs_path) {
-                            let _ = cache.store_symbols(&content_hash, language, &symbols);
-                            // Extract mtime+size before dropping the guard
-                            let file_meta = file_tree.files.get(&rel_path)
-                                .map(|entry| (entry.modified.timestamp(), entry.size as i64));
-                            if let Some((mtime, file_size)) = file_meta {
-                                let _ = cache.update_manifest(
-                                    &workspace_id,
-                                    &rel_path,
-                                    &content_hash,
-                                    mtime,
-                                    file_size,
-                                );
-                            }
+                    if let (Some(cache), Some(content_hash)) = (&cache, &content_hash) {
+                        let _ = cache.store_symbols(content_hash, language, &symbols);
+                        // Extract mtime+size before dropping the guard
+                        let file_meta = file_tree.files.get(&rel_path)
+                            .map(|entry| (entry.modified.timestamp_millis(), entry.size as i64));
+                        if let Some((mtime, file_size)) = file_meta {
+                            let _ = cache.update_manifest(
+                                &workspace_id,
+                                &rel_path,
+                                content_hash,
+                                mtime,
+                                file_size,
+                            );
                         }
                     }
 

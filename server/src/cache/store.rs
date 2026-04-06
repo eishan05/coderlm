@@ -71,22 +71,27 @@ impl CacheStore {
         Ok(())
     }
 
-    /// Look up cached symbols by content hash. Returns None if:
-    /// - No entry exists for this hash
+    /// Look up cached symbols by content hash + language. Returns None if:
+    /// - No entry exists for this hash+language combination
     /// - The entry exists but has stale version numbers
-    pub fn lookup_symbols(&self, content_hash: &str) -> Result<Option<Vec<Symbol>>> {
+    pub fn lookup_symbols(&self, content_hash: &str, language: Language) -> Result<Option<Vec<Symbol>>> {
+        let lang_str = serde_json::to_string(&language)?;
+        let lang_str = lang_str.trim_matches('"').to_string();
+
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT symbols_json FROM file_index
              WHERE content_hash = ?1
-               AND parser_version = ?2
-               AND grammar_version = ?3
-               AND symbol_schema_version = ?4",
+               AND language = ?2
+               AND parser_version = ?3
+               AND grammar_version = ?4
+               AND symbol_schema_version = ?5",
         )?;
 
         let result = stmt.query_row(
             rusqlite::params![
                 content_hash,
+                lang_str,
                 versions::PARSER_VERSION,
                 versions::GRAMMAR_VERSION,
                 versions::SYMBOL_SCHEMA_VERSION,
@@ -261,7 +266,7 @@ mod tests {
             .store_symbols("abc123hash", Language::Rust, &symbols)
             .unwrap();
 
-        let loaded = store.lookup_symbols("abc123hash").unwrap();
+        let loaded = store.lookup_symbols("abc123hash", Language::Rust).unwrap();
         assert!(loaded.is_some(), "Should find cached symbols");
         let loaded = loaded.unwrap();
         assert_eq!(loaded.len(), 2);
@@ -272,7 +277,7 @@ mod tests {
     #[test]
     fn test_lookup_symbols_returns_none_for_missing_hash() {
         let store = make_test_store();
-        let loaded = store.lookup_symbols("nonexistent").unwrap();
+        let loaded = store.lookup_symbols("nonexistent", Language::Rust).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -296,7 +301,7 @@ mod tests {
             ],
         ).unwrap();
 
-        let loaded = store.lookup_symbols("stale_hash").unwrap();
+        let loaded = store.lookup_symbols("stale_hash", Language::Rust).unwrap();
         assert!(loaded.is_none(), "Stale parser version should return None");
     }
 
@@ -319,7 +324,7 @@ mod tests {
             ],
         ).unwrap();
 
-        let loaded = store.lookup_symbols("stale_grammar").unwrap();
+        let loaded = store.lookup_symbols("stale_grammar", Language::Rust).unwrap();
         assert!(loaded.is_none(), "Stale grammar version should return None");
     }
 
@@ -342,7 +347,7 @@ mod tests {
             ],
         ).unwrap();
 
-        let loaded = store.lookup_symbols("stale_schema").unwrap();
+        let loaded = store.lookup_symbols("stale_schema", Language::Rust).unwrap();
         assert!(loaded.is_none(), "Stale schema version should return None");
     }
 
@@ -358,7 +363,7 @@ mod tests {
         store.store_symbols("shared_hash", Language::Rust, &symbols2).unwrap();
 
         // Should return whichever was stored (first or second, doesn't matter)
-        let loaded = store.lookup_symbols("shared_hash").unwrap();
+        let loaded = store.lookup_symbols("shared_hash", Language::Rust).unwrap();
         assert!(loaded.is_some());
     }
 
@@ -499,7 +504,7 @@ mod tests {
         };
 
         store.store_symbols("roundtrip_hash", Language::Python, &[sym.clone()]).unwrap();
-        let loaded = store.lookup_symbols("roundtrip_hash").unwrap().unwrap();
+        let loaded = store.lookup_symbols("roundtrip_hash", Language::Python).unwrap().unwrap();
         assert_eq!(loaded.len(), 1);
 
         let loaded = &loaded[0];

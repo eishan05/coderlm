@@ -237,6 +237,14 @@ impl AppState {
 
         info!("Evicting project: {}", path.display());
 
+        // Clear cached manifest entries for this workspace
+        if let Some(ref cache) = self.inner.cache {
+            let workspace_id = path.to_string_lossy().to_string();
+            if let Err(e) = cache.clear_workspace(&workspace_id) {
+                tracing::warn!("Failed to clear cache manifest for {}: {}", path.display(), e);
+            }
+        }
+
         // Remove the project (drops watcher)
         self.inner.projects.remove(&path);
 
@@ -244,6 +252,11 @@ impl AppState {
         self.inner.sessions.retain(|_, session| session.project_path != path);
 
         Ok(())
+    }
+
+    /// Returns a reference to the cache store, if available.
+    pub fn cache(&self) -> Option<&std::sync::Arc<CacheStore>> {
+        self.inner.cache.as_ref()
     }
 }
 

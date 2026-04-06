@@ -47,13 +47,14 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     // Create tables if they don't exist
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_index (
-            content_hash TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
             language TEXT NOT NULL,
             symbols_json TEXT NOT NULL,
             parser_version INTEGER NOT NULL,
             grammar_version TEXT NOT NULL,
             symbol_schema_version INTEGER NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+            created_at TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (content_hash, language)
         );
 
         CREATE TABLE IF NOT EXISTS workspace_manifest (

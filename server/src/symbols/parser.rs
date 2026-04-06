@@ -8,7 +8,7 @@ use crate::index::file_entry::Language;
 use crate::index::file_tree::FileTree;
 use crate::symbols::queries;
 use crate::symbols::symbol::{Symbol, SymbolKind};
-use crate::symbols::SymbolTable;
+use crate::symbols::{ImportEntry, ImportTable, SymbolTable};
 
 /// Extract symbols from a single file.
 pub fn extract_symbols_from_file(
@@ -535,14 +535,92 @@ fn extract_symbols_from_source(
     Ok(symbols)
 }
 
+/// Extract import statements from a single file's source code.
+pub fn extract_imports_from_source(
+    source: &str,
+    rel_path: &str,
+    language: Language,
+) -> Result<Vec<ImportEntry>> {
+    let config = match queries::get_language_config(language) {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
+    };
+
+    if config.imports_query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&config.language)?;
+
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => {
+            warn!("Failed to parse {} for imports", rel_path);
+            return Ok(Vec::new());
+        }
+    };
+
+    let query = tree_sitter::Query::new(&config.language, config.imports_query)?;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let source_idx = capture_names
+        .iter()
+        .position(|n| n == "import.source");
+
+    let mut imports = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let cap_name = &capture_names[cap.index as usize];
+            if cap_name == "import.source" {
+                let text = cap.node.utf8_text(source.as_bytes()).unwrap_or("");
+                // Strip surrounding quotes from Go string literals and JS/TS string fragments
+                let source_str = text.trim_matches('"').trim_matches('\'').to_string();
+                if source_str.is_empty() {
+                    continue;
+                }
+                let line = cap.node.start_position().row + 1; // 1-indexed
+                // Deduplicate: only insert unique (source, line) pairs
+                let key = (source_str.clone(), line);
+                if seen.insert(key) {
+                    imports.push(ImportEntry {
+                        source: source_str,
+                        line,
+                    });
+                }
+            }
+        }
+    }
+
+    let _ = source_idx; // suppress unused warning
+    debug!("Extracted {} imports from {}", imports.len(), rel_path);
+    Ok(imports)
+}
+
+/// Extract import statements from a file on disk.
+pub fn extract_imports_from_file(
+    root: &Path,
+    rel_path: &str,
+    language: Language,
+) -> Result<Vec<ImportEntry>> {
+    let abs_path = root.join(rel_path);
+    let source = std::fs::read_to_string(&abs_path)?;
+    extract_imports_from_source(&source, rel_path, language)
+}
+
 /// Extract symbols from all files in the tree. Runs on blocking threads
 /// with bounded concurrency.
 pub async fn extract_all_symbols(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    import_table: &Arc<ImportTable>,
 ) -> Result<usize> {
-    extract_all_symbols_cached(root, file_tree, symbol_table, None).await
+    extract_all_symbols_cached(root, file_tree, symbol_table, import_table, None).await
 }
 
 /// Cache-aware symbol extraction. For each parseable file:
@@ -550,16 +628,21 @@ pub async fn extract_all_symbols(
 ///    from the file_index via content hash (fast path).
 /// 2. Otherwise, parse the file, store results in cache for next time.
 ///
+/// Also extracts import statements into the `import_table` for dependency
+/// graph queries.
+///
 /// Returns `(total_symbols, cache_hits, cache_misses)`.
 pub async fn extract_all_symbols_cached(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    import_table: &Arc<ImportTable>,
     cache: Option<&Arc<crate::cache::CacheStore>>,
 ) -> Result<usize> {
     let root = root.to_path_buf();
     let file_tree = file_tree.clone();
     let symbol_table = symbol_table.clone();
+    let import_table = import_table.clone();
     let cache = cache.cloned();
 
     let count = tokio::task::spawn_blocking(move || -> Result<usize> {
@@ -593,6 +676,12 @@ pub async fn extract_all_symbols_cached(
                             }
                             if let Some(mut fe) = file_tree.files.get_mut(&rel_path) {
                                 fe.symbols_extracted = true;
+                            }
+                            // Extract imports even on cache hit (imports aren't cached)
+                            if let Ok(imports) = extract_imports_from_file(&root, &rel_path, language) {
+                                if !imports.is_empty() {
+                                    import_table.insert_file_imports(&rel_path, imports);
+                                }
                             }
                             total += count;
                             debug!("Cache hit for {} ({} symbols)", rel_path, count);
@@ -640,6 +729,14 @@ pub async fn extract_all_symbols_cached(
                     if let Some(mut entry) = file_tree.files.get_mut(&rel_path) {
                         entry.symbols_extracted = true;
                     }
+
+                    // Extract imports alongside symbols
+                    if let Ok(imports) = extract_imports_from_file(&root, &rel_path, language) {
+                        if !imports.is_empty() {
+                            import_table.insert_file_imports(&rel_path, imports);
+                        }
+                    }
+
                     total += count;
                 }
                 Err(e) => {
@@ -1948,7 +2045,8 @@ const (
         file_tree.insert(oversized_entry);
 
         let symbol_table = Arc::new(SymbolTable::new());
-        let count = extract_all_symbols(dir.path(), &file_tree, &symbol_table)
+        let import_table = Arc::new(ImportTable::new());
+        let count = extract_all_symbols(dir.path(), &file_tree, &symbol_table, &import_table)
             .await
             .unwrap();
 
@@ -1984,6 +2082,7 @@ const (
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         // Scan directory to populate file tree
         crate::index::walker::scan_directory(&root, &file_tree, 10_000_000).unwrap();
@@ -1993,7 +2092,7 @@ const (
         let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
 
         // First extraction - cache miss, should populate cache
-        let count = extract_all_symbols_cached(&root, &file_tree, &symbol_table, Some(&cache)).await.unwrap();
+        let count = extract_all_symbols_cached(&root, &file_tree, &symbol_table, &import_table, Some(&cache)).await.unwrap();
         assert!(count >= 2, "Should extract at least 2 symbols, got {}", count);
 
         // Verify symbols in table
@@ -2018,6 +2117,7 @@ const (
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         crate::index::walker::scan_directory(&root, &file_tree, 10_000_000).unwrap();
 
@@ -2025,7 +2125,7 @@ const (
         let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
 
         // First extraction populates cache
-        let count1 = extract_all_symbols_cached(&root, &file_tree, &symbol_table, Some(&cache)).await.unwrap();
+        let count1 = extract_all_symbols_cached(&root, &file_tree, &symbol_table, &import_table, Some(&cache)).await.unwrap();
         assert!(count1 >= 1);
 
         // Verify cache was actually populated
@@ -2037,12 +2137,13 @@ const (
         // but re-scan same directory so file entries have same mtime+size
         let file_tree2 = Arc::new(FileTree::new());
         let symbol_table2 = Arc::new(SymbolTable::new());
+        let import_table2 = Arc::new(ImportTable::new());
         crate::index::walker::scan_directory(&root, &file_tree2, 10_000_000).unwrap();
 
         assert!(symbol_table2.list_by_file("lib.rs").is_empty(), "Fresh symbol table should be empty");
 
         // Second extraction should use cache (same mtime+size since file unchanged)
-        let count2 = extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, Some(&cache)).await.unwrap();
+        let count2 = extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, &import_table2, Some(&cache)).await.unwrap();
         assert_eq!(count1, count2, "Cache hit should produce same symbol count");
 
         let syms = symbol_table2.list_by_file("lib.rs");
@@ -2061,6 +2162,7 @@ const (
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         crate::index::walker::scan_directory(&root, &file_tree, 10_000_000).unwrap();
 
@@ -2068,7 +2170,7 @@ const (
         let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
 
         // First extraction
-        extract_all_symbols_cached(&root, &file_tree, &symbol_table, Some(&cache)).await.unwrap();
+        extract_all_symbols_cached(&root, &file_tree, &symbol_table, &import_table, Some(&cache)).await.unwrap();
 
         // Modify the file (changes size, which makes cache miss)
         std::fs::write(&file_path, "pub fn replaced_function_with_longer_name() {}").unwrap();
@@ -2076,10 +2178,11 @@ const (
         // Re-scan to update file tree with new mtime/size
         let file_tree2 = Arc::new(FileTree::new());
         let symbol_table2 = Arc::new(SymbolTable::new());
+        let import_table2 = Arc::new(ImportTable::new());
         crate::index::walker::scan_directory(&root, &file_tree2, 10_000_000).unwrap();
 
         // Second extraction should detect change and re-extract
-        extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, Some(&cache)).await.unwrap();
+        extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, &import_table2, Some(&cache)).await.unwrap();
 
         let syms = symbol_table2.list_by_file("lib.rs");
         assert!(!syms.is_empty());
@@ -2733,5 +2836,135 @@ public class Disconnected {
             cls.doc_comment.is_none(),
             "Javadoc separated by a blank line should NOT be attached to the class"
         );
+    }
+
+    // ---- Import extraction tests ----
+
+    #[test]
+    fn test_python_import_extraction() {
+        let source = r#"
+import os
+import sys
+from pathlib import Path
+from collections import OrderedDict
+"#;
+        let imports = extract_imports_from_source(source, "test.py", Language::Python).unwrap();
+        let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(sources.contains(&"os"), "Expected 'os' in imports, got: {:?}", sources);
+        assert!(sources.contains(&"sys"), "Expected 'sys' in imports, got: {:?}", sources);
+        assert!(sources.contains(&"pathlib"), "Expected 'pathlib' in imports, got: {:?}", sources);
+        assert!(sources.contains(&"collections"), "Expected 'collections' in imports, got: {:?}", sources);
+    }
+
+    #[test]
+    fn test_rust_import_extraction() {
+        let source = r#"
+use std::collections::HashMap;
+use anyhow::Result;
+use crate::index::file_entry::Language;
+"#;
+        let imports = extract_imports_from_source(source, "test.rs", Language::Rust).unwrap();
+        let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(!imports.is_empty(), "Expected imports from Rust use declarations");
+        // Should capture the path prefix or top-level crate
+        assert!(
+            sources.iter().any(|s| s.contains("std")),
+            "Expected 'std' in Rust imports, got: {:?}", sources
+        );
+    }
+
+    #[test]
+    fn test_typescript_import_extraction() {
+        let source = r#"
+import { useState } from 'react';
+import axios from 'axios';
+import { Router } from './router';
+"#;
+        let imports = extract_imports_from_source(source, "test.ts", Language::TypeScript).unwrap();
+        let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(sources.contains(&"react"), "Expected 'react' in imports, got: {:?}", sources);
+        assert!(sources.contains(&"axios"), "Expected 'axios' in imports, got: {:?}", sources);
+        assert!(sources.contains(&"./router"), "Expected './router' in imports, got: {:?}", sources);
+    }
+
+    #[test]
+    fn test_javascript_import_extraction() {
+        let source = r#"
+import express from 'express';
+import { join } from 'path';
+"#;
+        let imports = extract_imports_from_source(source, "test.js", Language::JavaScript).unwrap();
+        let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(sources.contains(&"express"), "Expected 'express' in JS imports, got: {:?}", sources);
+        assert!(sources.contains(&"path"), "Expected 'path' in JS imports, got: {:?}", sources);
+    }
+
+    #[test]
+    fn test_go_import_extraction() {
+        let source = r#"
+package main
+
+import (
+    "fmt"
+    "os"
+    "net/http"
+)
+"#;
+        let imports = extract_imports_from_source(source, "test.go", Language::Go).unwrap();
+        let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(sources.contains(&"fmt"), "Expected 'fmt' in Go imports, got: {:?}", sources);
+        assert!(sources.contains(&"os"), "Expected 'os' in Go imports, got: {:?}", sources);
+        assert!(sources.contains(&"net/http"), "Expected 'net/http' in Go imports, got: {:?}", sources);
+    }
+
+    #[test]
+    fn test_java_import_extraction() {
+        let source = r#"
+import java.util.List;
+import java.util.Map;
+import org.junit.Test;
+"#;
+        let imports = extract_imports_from_source(source, "Test.java", Language::Java).unwrap();
+        let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
+        assert!(!imports.is_empty(), "Expected imports from Java import declarations");
+        assert!(
+            sources.iter().any(|s| s.contains("java.util")),
+            "Expected 'java.util' in Java imports, got: {:?}", sources
+        );
+    }
+
+    #[test]
+    fn test_import_extraction_empty_file() {
+        let source = "";
+        let imports = extract_imports_from_source(source, "test.py", Language::Python).unwrap();
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn test_import_extraction_no_imports() {
+        let source = r#"
+def hello():
+    print("Hello, world!")
+"#;
+        let imports = extract_imports_from_source(source, "test.py", Language::Python).unwrap();
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn test_import_extraction_line_numbers() {
+        let source = r#"import os
+import sys
+"#;
+        let imports = extract_imports_from_source(source, "test.py", Language::Python).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].line, 1);
+        assert_eq!(imports[1].line, 2);
+    }
+
+    #[test]
+    fn test_import_extraction_unsupported_language() {
+        let source = "some content";
+        let imports = extract_imports_from_source(source, "test.md", Language::Markdown).unwrap();
+        assert!(imports.is_empty());
     }
 }

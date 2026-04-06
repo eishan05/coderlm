@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::ops::{content, structure, symbol_ops};
+use crate::ops::{content, imports, structure, symbol_ops};
 use crate::server::state::{AppState, Project};
 use crate::symbols::symbol::SymbolKind;
 
@@ -137,6 +137,20 @@ pub struct SymbolsParams {
     /// Maximum number of symbols to return. Defaults to 100.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Parameters for `coderlm_imports` — get imports for a file.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ImportsParams {
+    /// Relative path to the file to list imports for.
+    pub file: String,
+}
+
+/// Parameters for `coderlm_dependents` — find files that import from a given module.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct DependentsParams {
+    /// Module/file path to find dependents for (substring match).
+    pub file: String,
 }
 
 /// (Empty) Parameters for `coderlm_stats`.
@@ -420,6 +434,33 @@ impl CoderlmMcpServer {
             "indexing_complete": self.project().is_indexing_complete(),
         }))
         .unwrap_or_else(|e| format!("Error: {}", e))
+    }
+
+    /// Returns the imports (dependencies) for a given file. Shows which modules
+    /// and packages the file depends on, with line numbers.
+    #[tool(
+        name = "coderlm_imports",
+        annotations(read_only_hint = true, title = "File Imports")
+    )]
+    pub fn coderlm_imports(&self, params: Parameters<ImportsParams>) -> String {
+        let p = &params.0;
+        let result = imports::get_imports(&self.project().import_table, &p.file);
+        serde_json::to_string_pretty(&result)
+            .unwrap_or_else(|e| format!("Error: {}", e))
+    }
+
+    /// Finds files that depend on (import from) a given module or file path.
+    /// Uses substring matching, so searching for "utils" will find files
+    /// importing "./utils", "../utils", "project/utils", etc.
+    #[tool(
+        name = "coderlm_dependents",
+        annotations(read_only_hint = true, title = "Find Dependents")
+    )]
+    pub fn coderlm_dependents(&self, params: Parameters<DependentsParams>) -> String {
+        let p = &params.0;
+        let result = imports::get_dependents(&self.project().import_table, &p.file);
+        serde_json::to_string_pretty(&result)
+            .unwrap_or_else(|e| format!("Error: {}", e))
     }
 
     /// Returns indexing stats: project root, file count, symbol count, and

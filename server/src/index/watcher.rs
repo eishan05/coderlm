@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 use crate::config;
 use crate::index::file_entry::FileEntry;
 use crate::index::file_tree::FileTree;
-use crate::symbols::parser::extract_symbols_from_file;
-use crate::symbols::SymbolTable;
+use crate::symbols::parser::{extract_imports_from_file, extract_symbols_from_file};
+use crate::symbols::{ImportTable, SymbolTable};
 
 /// A file-change event sent from the watcher callback to the async processor.
 #[derive(Debug, Clone)]
@@ -39,6 +39,7 @@ pub fn start_watcher(
     root: &Path,
     file_tree: Arc<FileTree>,
     symbol_table: Arc<SymbolTable>,
+    import_table: Arc<ImportTable>,
     max_file_size: u64,
 ) -> Result<WatcherHandle> {
     let root_buf = root.to_path_buf();
@@ -55,7 +56,7 @@ pub fn start_watcher(
 
     // Spawn the async processor that drains the channel and handles events.
     let rt = tokio::runtime::Handle::current();
-    rt.spawn(process_events(rx, file_tree.clone(), symbol_table.clone(), max_file_size, coderlm_ignore));
+    rt.spawn(process_events(rx, file_tree.clone(), symbol_table.clone(), import_table.clone(), max_file_size, coderlm_ignore));
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(500),
@@ -160,6 +161,7 @@ async fn process_events(
     mut rx: mpsc::Receiver<Vec<WatcherEvent>>,
     file_tree: Arc<FileTree>,
     symbol_table: Arc<SymbolTable>,
+    import_table: Arc<ImportTable>,
     max_file_size: u64,
     coderlm_ignore: Arc<Gitignore>,
 ) {
@@ -171,6 +173,7 @@ async fn process_events(
                         &root,
                         &file_tree,
                         &symbol_table,
+                        &import_table,
                         max_file_size,
                         &coderlm_ignore,
                         &rel_path,
@@ -178,7 +181,7 @@ async fn process_events(
                     ).await;
                 }
                 WatcherEvent::Deleted { rel_path } => {
-                    handle_file_delete(&file_tree, &symbol_table, &rel_path);
+                    handle_file_delete(&file_tree, &symbol_table, &import_table, &rel_path);
                 }
             }
         }
@@ -192,6 +195,7 @@ async fn handle_file_change(
     root: &Path,
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    import_table: &Arc<ImportTable>,
     max_file_size: u64,
     coderlm_ignore: &Gitignore,
     rel_path: &str,
@@ -229,21 +233,23 @@ async fn handle_file_change(
     entry.oversized = is_oversized;
     file_tree.insert(entry);
 
-    // Remove old symbols for this file
+    // Remove old symbols and imports for this file
     symbol_table.remove_file(rel_path);
+    import_table.remove_file(rel_path);
 
     // Skip symbol extraction for oversized files
     if is_oversized {
         return;
     }
 
-    // Re-extract symbols on a blocking thread so we don't block the
+    // Re-extract symbols and imports on a blocking thread so we don't block the
     // async event processor (tree-sitter parsing is CPU-bound).
     if language.has_tree_sitter_support() {
         let root = root.to_path_buf();
         let rel_path = rel_path.to_string();
         let file_tree = file_tree.clone();
         let symbol_table = symbol_table.clone();
+        let import_table = import_table.clone();
 
         tokio::task::spawn_blocking(move || {
             match extract_symbols_from_file(&root, &rel_path, language) {
@@ -261,6 +267,19 @@ async fn handle_file_change(
                     debug!("Failed to re-extract symbols from {}: {}", rel_path, e);
                 }
             }
+            // Extract imports
+            match extract_imports_from_file(&root, &rel_path, language) {
+                Ok(imports) => {
+                    if !imports.is_empty() {
+                        let count = imports.len();
+                        import_table.insert_file_imports(&rel_path, imports);
+                        debug!("Re-extracted {} imports from {}", count, rel_path);
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to re-extract imports from {}: {}", rel_path, e);
+                }
+            }
         }).await.unwrap_or_else(|e| {
             warn!("Symbol extraction task panicked: {}", e);
         });
@@ -270,10 +289,12 @@ async fn handle_file_change(
 fn handle_file_delete(
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
+    import_table: &Arc<ImportTable>,
     rel_path: &str,
 ) {
     if file_tree.remove(rel_path).is_some() {
         symbol_table.remove_file(rel_path);
+        import_table.remove_file(rel_path);
         debug!("Removed {} from index", rel_path);
     }
 }
@@ -291,7 +312,7 @@ fn should_skip(rel_path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::index::file_entry::Language;
-    use crate::symbols::SymbolTable;
+    use crate::symbols::{ImportTable, SymbolTable};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -411,11 +432,13 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &empty_ignore(),
             "src/lib.rs",
@@ -435,11 +458,13 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &empty_ignore(),
             "src/lib.rs",
@@ -461,12 +486,14 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         // Use a tiny max_file_size so the file is "oversized"
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1, // 1 byte max
             &empty_ignore(),
             "big.rs",
@@ -486,12 +513,14 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         // First change
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &empty_ignore(),
             "src/lib.rs",
@@ -510,6 +539,7 @@ mod tests {
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &empty_ignore(),
             "src/lib.rs",
@@ -528,6 +558,7 @@ mod tests {
     async fn test_handle_file_delete_removes_from_tree_and_symbols() {
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         // Manually insert an entry so we can test deletion
         use crate::symbols::symbol::{Symbol, SymbolKind};
@@ -550,7 +581,7 @@ mod tests {
         assert!(file_tree.get("src/gone.rs").is_some());
         assert_eq!(symbol_table.list_by_file("src/gone.rs").len(), 1);
 
-        handle_file_delete(&file_tree, &symbol_table, "src/gone.rs");
+        handle_file_delete(&file_tree, &symbol_table, &import_table, "src/gone.rs");
 
         assert!(file_tree.get("src/gone.rs").is_none());
         assert_eq!(symbol_table.list_by_file("src/gone.rs").len(), 0);
@@ -563,6 +594,7 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         // Pre-insert an entry for the file we'll "delete"
         use crate::symbols::symbol::{Symbol, SymbolKind};
@@ -585,7 +617,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         let ft = file_tree.clone();
         let st = symbol_table.clone();
-        let handle = tokio::spawn(process_events(rx, ft, st, 1024 * 1024, Arc::new(empty_ignore())));
+        let it = import_table.clone();
+        let handle = tokio::spawn(process_events(rx, ft, st, it, 1024 * 1024, Arc::new(empty_ignore())));
 
         // Send a batch with one Changed and one Deleted event
         tx.send(vec![
@@ -651,11 +684,13 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &empty_ignore(),
             "image.png",
@@ -763,11 +798,13 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &gi,
             "generated/proto.rs",
@@ -788,11 +825,13 @@ mod tests {
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
 
         handle_file_change(
             &root,
             &file_tree,
             &symbol_table,
+            &import_table,
             1024 * 1024,
             &gi,
             "src/lib.rs",

@@ -13,13 +13,15 @@ use crate::index::{walker, watcher};
 use crate::ops::annotations;
 use crate::server::errors::AppError;
 use crate::server::session::Session;
-use crate::symbols::{parser, SymbolTable};
+use crate::symbols::{parser, ImportTable, SymbolTable};
 
 /// A single indexed project with its own file tree, symbol table, and watcher.
 pub struct Project {
     pub root: PathBuf,
     pub file_tree: Arc<FileTree>,
     pub symbol_table: Arc<SymbolTable>,
+    /// Import dependency graph extracted from source files.
+    pub import_table: Arc<ImportTable>,
     // Held alive to keep the filesystem watcher running; dropped on eviction.
     #[allow(dead_code)]
     pub watcher: Option<watcher::WatcherHandle>,
@@ -129,6 +131,7 @@ impl AppState {
         // Scan directory
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
+        let import_table = Arc::new(ImportTable::new());
         let max_file_size = self.inner.max_file_size;
 
         info!("Indexing new project: {}", canonical.display());
@@ -142,6 +145,7 @@ impl AppState {
             &canonical,
             file_tree.clone(),
             symbol_table.clone(),
+            import_table.clone(),
             max_file_size,
         )
         .ok();
@@ -153,6 +157,7 @@ impl AppState {
             root: canonical.clone(),
             file_tree: file_tree.clone(),
             symbol_table: symbol_table.clone(),
+            import_table: import_table.clone(),
             watcher: watcher_handle,
             last_active: Mutex::new(Utc::now()),
             indexing_complete_rx: indexing_rx,
@@ -165,11 +170,12 @@ impl AppState {
         // signal readiness.
         let ft = file_tree;
         let st = symbol_table;
+        let it = import_table;
         let root = project.root.clone();
         let cache = self.inner.cache.clone();
         tokio::spawn(async move {
             info!("Starting symbol extraction for {}...", root.display());
-            match parser::extract_all_symbols_cached(&root, &ft, &st, cache.as_ref()).await {
+            match parser::extract_all_symbols_cached(&root, &ft, &st, &it, cache.as_ref()).await {
                 Ok(count) => {
                     info!("Extracted {} symbols for {}", count, root.display());
                     // Load annotations now that symbols are available.
@@ -279,6 +285,7 @@ mod tests {
             root: PathBuf::from("/tmp/test-project"),
             file_tree: Arc::new(FileTree::new()),
             symbol_table: Arc::new(SymbolTable::new()),
+            import_table: Arc::new(ImportTable::new()),
             watcher: None,
             last_active: Mutex::new(Utc::now()),
             indexing_complete_rx: rx,
@@ -305,6 +312,7 @@ mod tests {
             root: PathBuf::from("/tmp/test-project"),
             file_tree: Arc::new(FileTree::new()),
             symbol_table: Arc::new(SymbolTable::new()),
+            import_table: Arc::new(ImportTable::new()),
             watcher: None,
             last_active: Mutex::new(Utc::now()),
             indexing_complete_rx: rx,
@@ -327,6 +335,7 @@ mod tests {
             root: PathBuf::from("/tmp/test-project"),
             file_tree: Arc::new(FileTree::new()),
             symbol_table: Arc::new(SymbolTable::new()),
+            import_table: Arc::new(ImportTable::new()),
             watcher: None,
             last_active: Mutex::new(Utc::now()),
             indexing_complete_rx: rx,
@@ -349,6 +358,7 @@ mod tests {
             root: PathBuf::from("/tmp/test-project"),
             file_tree: Arc::new(FileTree::new()),
             symbol_table: Arc::new(SymbolTable::new()),
+            import_table: Arc::new(ImportTable::new()),
             watcher: None,
             last_active: Mutex::new(Utc::now()),
             indexing_complete_rx: rx,

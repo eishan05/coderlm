@@ -41,6 +41,23 @@ fn require_project(state: &AppState, headers: &HeaderMap) -> Result<Arc<Project>
     Ok(project)
 }
 
+/// Convert a symbol lookup error into an AppError, enriching the message when
+/// indexing hasn't completed yet so the client can distinguish "symbol missing"
+/// from "symbol not yet indexed".
+fn symbol_not_found_or_not_ready(err: String, indexing_complete: bool) -> AppError {
+    if indexing_complete {
+        AppError::NotFound(err)
+    } else {
+        AppError::BadRequest(format!(
+            "{}. NOTE: Symbol indexing is still in progress (indexing_complete=false). \
+             The symbol may not have been extracted yet. \
+             Call GET /api/v1/symbols/ready?wait=true to wait for indexing to finish, \
+             then retry.",
+            err
+        ))
+    }
+}
+
 fn record_history(state: &AppState, session_id: Option<&str>, method: &str, path: &str, preview: &str) {
     if let Some(id) = session_id {
         if let Some(mut session) = state.inner.sessions.get_mut(id) {
@@ -160,8 +177,15 @@ async fn create_session(
     let created_at = session.created_at;
     state.inner.sessions.insert(id.clone(), session);
 
-    // Annotations are now loaded automatically after symbol extraction
-    // completes (see state.rs), so no racy spawn is needed here.
+    // For newly-created projects, annotations are loaded automatically after
+    // symbol extraction completes (see state.rs). For already-resident projects
+    // (indexing already done), reload annotations now to pick up any on-disk changes.
+    if project.is_indexing_complete() {
+        let ft = project.file_tree.clone();
+        let st = project.symbol_table.clone();
+        let root = project.root.clone();
+        let _ = annotations::load_annotations(&root, &ft, &st);
+    }
 
     Ok(Json(json!({
         "session_id": id,
@@ -462,7 +486,7 @@ async fn get_implementation(
         &params.file,
         params.line,
     )
-    .map_err(AppError::NotFound)?;
+    .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let preview = format!("{}::{} ({} bytes)", params.file, params.symbol, source.len());
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/implementation", &preview);
     Ok(Json(json!({
@@ -499,7 +523,7 @@ async fn find_tests(
         limit,
         params.line,
     )
-    .map_err(AppError::NotFound)?;
+    .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let preview = format!("{} tests for {}", tests.len(), params.symbol);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/tests", &preview);
     Ok(Json(json!({ "tests": tests, "count": tests.len(), "indexing_complete": indexing_complete })))
@@ -531,7 +555,7 @@ async fn find_callers(
         limit,
         params.line,
     )
-    .map_err(AppError::NotFound)?;
+    .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/callers", &preview);
     Ok(Json(json!({ "callers": callers, "count": callers.len(), "indexing_complete": indexing_complete })))
@@ -559,7 +583,7 @@ async fn list_variables(
         &params.file,
         params.line,
     )
-    .map_err(AppError::NotFound)?;
+    .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let preview = format!("{} variables in {}", vars.len(), params.function);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/variables", &preview);
     Ok(Json(json!({ "variables": vars, "count": vars.len(), "indexing_complete": indexing_complete })))

@@ -23,12 +23,16 @@ pub struct Project {
     #[allow(dead_code)]
     pub watcher: Option<watcher::WatcherHandle>,
     pub last_active: Mutex<DateTime<Utc>>,
-    /// Tracks whether symbol extraction has completed. Subscribe via `indexing_complete_rx`.
+    /// Tracks whether the initial full symbol extraction has completed.
+    /// This is a one-shot flag: it starts `false` and flips to `true` once.
+    /// Incremental reindexing triggered by the filesystem watcher does NOT
+    /// reset this flag, since those updates are file-level and brief.
     pub indexing_complete_rx: watch::Receiver<bool>,
 }
 
 impl Project {
-    /// Returns `true` if symbol extraction has finished.
+    /// Returns `true` if the initial symbol extraction has finished.
+    /// Note: this does not track incremental watcher-driven reindexing.
     pub fn is_indexing_complete(&self) -> bool {
         *self.indexing_complete_rx.borrow()
     }

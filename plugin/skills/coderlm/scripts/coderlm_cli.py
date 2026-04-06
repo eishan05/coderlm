@@ -185,7 +185,12 @@ def cmd_init(args: argparse.Namespace) -> None:
             )
             print(f" done ({ready_result.get('symbol_count', 0)} symbols)")
         except SystemExit:
-            print(" (timed out or failed, symbols may be incomplete)")
+            print(
+                "\nERROR: Failed to wait for symbol extraction to complete. "
+                "Symbols may be incomplete. Use 'coderlm_cli.py ready --wait' to retry.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     else:
         print("Indexing already complete.")
 

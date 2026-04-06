@@ -241,6 +241,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         }
     }
 
@@ -501,6 +502,7 @@ mod tests {
             definition: Some("Converts x to string".to_string()),
             parent: Some("MyClass".to_string()),
             decorators: vec!["@property".to_string(), "@cache".to_string()],
+            doc_comment: Some("Converts x to string representation.".to_string()),
         };
 
         store.store_symbols("roundtrip_hash", Language::Python, &[sym.clone()]).unwrap();
@@ -518,6 +520,7 @@ mod tests {
         assert_eq!(loaded.definition, sym.definition);
         assert_eq!(loaded.parent, sym.parent);
         assert_eq!(loaded.decorators, sym.decorators);
+        assert_eq!(loaded.doc_comment, sym.doc_comment);
     }
 
     // --- default_db_path ---

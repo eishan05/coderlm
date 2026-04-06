@@ -544,6 +544,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         });
 
         assert!(file_tree.get("src/gone.rs").is_some());
@@ -578,6 +579,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         });
 
         let (tx, rx) = mpsc::channel(64);

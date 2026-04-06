@@ -8,7 +8,7 @@ Usage:
   python3 coderlm_cli.py init [--port PORT] [--cwd PATH]
   python3 coderlm_cli.py structure [--depth N]
   python3 coderlm_cli.py symbols [--kind KIND] [--file FILE] [--limit N]
-  python3 coderlm_cli.py search QUERY [--limit N]
+  python3 coderlm_cli.py search QUERY [--offset N] [--limit N]
   python3 coderlm_cli.py impl SYMBOL --file FILE [--line N]
   python3 coderlm_cli.py callers SYMBOL --file FILE [--limit N] [--line N]
   python3 coderlm_cli.py tests SYMBOL --file FILE [--limit N] [--line N]
@@ -248,6 +248,8 @@ def cmd_symbols(args: argparse.Namespace) -> None:
 def cmd_search(args: argparse.Namespace) -> None:
     state = _load_state()
     params = {"q": args.query}
+    if args.offset is not None:
+        params["offset"] = args.offset
     if args.limit is not None:
         params["limit"] = args.limit
     _output(_get(state, "/symbols/search", params))
@@ -448,6 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
     # search
     p_search = sub.add_parser("search", help="Search symbols by name")
     p_search.add_argument("query", help="Search term")
+    p_search.add_argument("--offset", type=int, default=None, help="Pagination offset")
     p_search.add_argument("--limit", type=int, default=None)
     p_search.set_defaults(func=cmd_search)
 

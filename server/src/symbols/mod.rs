@@ -7,6 +7,14 @@ use std::collections::HashSet;
 
 use symbol::Symbol;
 
+/// Result of a symbol search with pagination metadata.
+pub struct SearchResult {
+    /// The page of matching symbols (after offset/limit applied).
+    pub symbols: Vec<Symbol>,
+    /// Total number of symbols matching the query (before pagination).
+    pub total: usize,
+}
+
 /// Thread-safe symbol table with secondary indices for fast lookup.
 ///
 /// Primary key format: "file::name::line" where line is the 1-indexed start line.
@@ -141,18 +149,27 @@ impl SymbolTable {
         results
     }
 
-    pub fn search(&self, query: &str, limit: usize) -> Vec<Symbol> {
+    pub fn search(&self, query: &str, offset: usize, limit: usize) -> SearchResult {
         let query_lower = query.to_lowercase();
-        let mut results = Vec::new();
-        for entry in self.symbols.iter() {
-            if entry.value().name.to_lowercase().contains(&query_lower) {
-                results.push(entry.value().clone());
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-        results
+        let mut matches: Vec<Symbol> = self
+            .symbols
+            .iter()
+            .filter(|entry| entry.value().name.to_lowercase().contains(&query_lower))
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        // Deterministic ordering: sort by name, then file, then line number
+        matches.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line_range.0.cmp(&b.line_range.0))
+        });
+
+        let total = matches.len();
+        let symbols: Vec<Symbol> = matches.into_iter().skip(offset).take(limit).collect();
+
+        SearchResult { symbols, total }
     }
 
     pub fn list_by_file(&self, file: &str) -> Vec<Symbol> {
@@ -337,8 +354,150 @@ mod tests {
         table.insert(sym2);
         table.insert(sym3);
 
-        let results = table.search("new", 10);
-        assert_eq!(results.len(), 2);
+        let result = table.search("new", 0, 10);
+        assert_eq!(result.symbols.len(), 2);
+        assert_eq!(result.total, 2);
+    }
+
+    #[test]
+    fn test_search_returns_deterministic_order() {
+        let table = SymbolTable::new();
+
+        // Insert in deliberately non-alphabetical order
+        let sym1 = make_symbol("create_widget", "src/z_file.rs", 10, None);
+        let sym2 = make_symbol("create_thing", "src/a_file.rs", 20, None);
+        let sym3 = make_symbol("create_bar", "src/m_file.rs", 30, None);
+        let sym4 = make_symbol("create_bar", "src/a_file.rs", 5, None);
+
+        table.insert(sym1);
+        table.insert(sym2);
+        table.insert(sym3);
+        table.insert(sym4);
+
+        let result = table.search("create", 0, 100);
+        assert_eq!(result.total, 4);
+        assert_eq!(result.symbols.len(), 4);
+
+        // Should be sorted by name first, then file, then line
+        assert_eq!(result.symbols[0].name, "create_bar");
+        assert_eq!(result.symbols[0].file, "src/a_file.rs");
+        assert_eq!(result.symbols[1].name, "create_bar");
+        assert_eq!(result.symbols[1].file, "src/m_file.rs");
+        assert_eq!(result.symbols[2].name, "create_thing");
+        assert_eq!(result.symbols[2].file, "src/a_file.rs");
+        assert_eq!(result.symbols[3].name, "create_widget");
+        assert_eq!(result.symbols[3].file, "src/z_file.rs");
+
+        // Running the same search again should produce identical results
+        let result2 = table.search("create", 0, 100);
+        for (a, b) in result.symbols.iter().zip(result2.symbols.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.file, b.file);
+            assert_eq!(a.line_range, b.line_range);
+        }
+    }
+
+    #[test]
+    fn test_search_pagination_offset_and_limit() {
+        let table = SymbolTable::new();
+
+        // Insert 5 symbols matching "item"
+        for i in 0..5 {
+            let sym = make_symbol(
+                &format!("item_{}", (b'a' + i) as char),
+                "src/items.rs",
+                (i as usize) * 10 + 10,
+                None,
+            );
+            table.insert(sym);
+        }
+
+        // Full result
+        let full = table.search("item", 0, 100);
+        assert_eq!(full.total, 5);
+        assert_eq!(full.symbols.len(), 5);
+
+        // First page of 2
+        let page1 = table.search("item", 0, 2);
+        assert_eq!(page1.total, 5);
+        assert_eq!(page1.symbols.len(), 2);
+        assert_eq!(page1.symbols[0].name, "item_a");
+        assert_eq!(page1.symbols[1].name, "item_b");
+
+        // Second page of 2
+        let page2 = table.search("item", 2, 2);
+        assert_eq!(page2.total, 5);
+        assert_eq!(page2.symbols.len(), 2);
+        assert_eq!(page2.symbols[0].name, "item_c");
+        assert_eq!(page2.symbols[1].name, "item_d");
+
+        // Third page of 2 (only 1 remaining)
+        let page3 = table.search("item", 4, 2);
+        assert_eq!(page3.total, 5);
+        assert_eq!(page3.symbols.len(), 1);
+        assert_eq!(page3.symbols[0].name, "item_e");
+
+        // Offset beyond total returns empty
+        let empty = table.search("item", 10, 2);
+        assert_eq!(empty.total, 5);
+        assert_eq!(empty.symbols.len(), 0);
+    }
+
+    #[test]
+    fn test_search_total_count_independent_of_limit() {
+        let table = SymbolTable::new();
+
+        for i in 0..10 {
+            let sym = make_symbol(
+                &format!("handler_{}", i),
+                "src/handlers.rs",
+                i * 10 + 10,
+                None,
+            );
+            table.insert(sym);
+        }
+
+        // limit=3 but total should still reflect all 10 matches
+        let result = table.search("handler", 0, 3);
+        assert_eq!(result.total, 10);
+        assert_eq!(result.symbols.len(), 3);
+    }
+
+    #[test]
+    fn test_search_same_name_different_files_deterministic() {
+        let table = SymbolTable::new();
+
+        // Same name in different files — ordering by file should be stable
+        let sym1 = make_symbol("init", "src/b.rs", 10, None);
+        let sym2 = make_symbol("init", "src/a.rs", 10, None);
+        let sym3 = make_symbol("init", "src/c.rs", 10, None);
+
+        table.insert(sym1);
+        table.insert(sym2);
+        table.insert(sym3);
+
+        let result = table.search("init", 0, 100);
+        assert_eq!(result.symbols[0].file, "src/a.rs");
+        assert_eq!(result.symbols[1].file, "src/b.rs");
+        assert_eq!(result.symbols[2].file, "src/c.rs");
+    }
+
+    #[test]
+    fn test_search_same_name_same_file_sorted_by_line() {
+        let table = SymbolTable::new();
+
+        let sym1 = make_symbol("render", "src/view.rs", 100, None);
+        let sym2 = make_symbol("render", "src/view.rs", 20, None);
+        let sym3 = make_symbol("render", "src/view.rs", 50, None);
+
+        table.insert(sym1);
+        table.insert(sym2);
+        table.insert(sym3);
+
+        let result = table.search("render", 0, 100);
+        assert_eq!(result.symbols[0].line_range.0, 20);
+        assert_eq!(result.symbols[1].line_range.0, 50);
+        assert_eq!(result.symbols[2].line_range.0, 100);
     }
 
     #[test]

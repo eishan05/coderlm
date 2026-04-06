@@ -410,6 +410,7 @@ async fn list_symbols(
 #[derive(Deserialize)]
 struct SymbolSearchQuery {
     q: String,
+    offset: Option<usize>,
     limit: Option<usize>,
 }
 
@@ -420,11 +421,19 @@ async fn search_symbols(
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
     let indexing_complete = project.is_indexing_complete();
+    let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(20);
-    let results = symbol_ops::search_symbols(&project.symbol_table, &params.q, limit);
-    let preview = format!("{} matches for '{}'", results.len(), params.q);
+    let result = symbol_ops::search_symbols(&project.symbol_table, &params.q, offset, limit);
+    let preview = format!("{} matches for '{}' (total {})", result.symbols.len(), params.q, result.total);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/search", &preview);
-    Ok(Json(json!({ "symbols": results, "count": results.len(), "indexing_complete": indexing_complete })))
+    Ok(Json(json!({
+        "symbols": result.symbols,
+        "count": result.symbols.len(),
+        "total": result.total,
+        "offset": offset,
+        "limit": limit,
+        "indexing_complete": indexing_complete,
+    })))
 }
 
 #[derive(Deserialize)]

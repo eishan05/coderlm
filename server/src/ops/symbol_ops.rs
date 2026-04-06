@@ -30,8 +30,13 @@ pub fn list_symbols(
     results
 }
 
-pub fn search_symbols(symbol_table: &Arc<SymbolTable>, query: &str, limit: usize) -> Vec<Symbol> {
-    symbol_table.search(query, limit)
+pub fn search_symbols(
+    symbol_table: &Arc<SymbolTable>,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> crate::symbols::SearchResult {
+    symbol_table.search(query, offset, limit)
 }
 
 pub fn get_implementation(

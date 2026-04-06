@@ -74,12 +74,26 @@ pub const VARIABLES_QUERY: &str = r#"
   pattern: (identifier) @var.name)
 "#;
 
+pub const IMPORTS_QUERY: &str = r#"
+(use_declaration
+  argument: (scoped_identifier
+    path: (_) @import.source))
+
+(use_declaration
+  argument: (scoped_use_list
+    path: (_) @import.source))
+
+(use_declaration
+  argument: (identifier) @import.source)
+"#;
+
 pub fn config() -> LanguageConfig {
     LanguageConfig {
         language: tree_sitter_rust::LANGUAGE.into(),
         symbols_query: SYMBOLS_QUERY,
         callers_query: CALLERS_QUERY,
         variables_query: VARIABLES_QUERY,
+        imports_query: IMPORTS_QUERY,
         test_patterns: vec![
             TestPattern::Attribute("test"),
             TestPattern::FunctionPrefix("test"),

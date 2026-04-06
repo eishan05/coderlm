@@ -28,6 +28,9 @@ pub struct LanguageConfig {
     pub callers_query: &'static str,
     /// Tree-sitter query for local variable bindings. Captures `@var.name`.
     pub variables_query: &'static str,
+    /// Tree-sitter query for import statements. Captures `@import.source` for the
+    /// module/package being imported (e.g., `os`, `std::collections`, `./utils`).
+    pub imports_query: &'static str,
     pub test_patterns: Vec<TestPattern>,
 }
 

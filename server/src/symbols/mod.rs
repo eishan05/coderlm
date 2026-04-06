@@ -3,6 +3,7 @@ pub mod queries;
 pub mod symbol;
 
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use symbol::Symbol;
@@ -188,6 +189,115 @@ impl SymbolTable {
 
     pub fn len(&self) -> usize {
         self.symbols.len()
+    }
+}
+
+/// A single import entry extracted from a source file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportEntry {
+    /// The import source string (e.g., "os.path", "std::collections", "./utils").
+    pub source: String,
+    /// The 1-indexed line number where the import appears.
+    pub line: usize,
+}
+
+/// Thread-safe import table for tracking file-level import dependencies.
+///
+/// Primary index: file path -> list of imports from that file.
+/// Reverse index: import source -> set of files that import it.
+pub struct ImportTable {
+    /// Forward index: file path -> imports from that file.
+    pub by_file: DashMap<String, Vec<ImportEntry>>,
+    /// Reverse index: import source string -> set of files importing it.
+    /// Used for "what depends on this?" queries.
+    pub by_source: DashMap<String, HashSet<String>>,
+}
+
+impl ImportTable {
+    pub fn new() -> Self {
+        Self {
+            by_file: DashMap::new(),
+            by_source: DashMap::new(),
+        }
+    }
+
+    /// Insert imports for a file. Replaces any existing imports for that file.
+    pub fn insert_file_imports(&self, file: &str, imports: Vec<ImportEntry>) {
+        // Remove old entries first to keep reverse index consistent
+        self.remove_file(file);
+
+        // Update reverse index
+        for imp in &imports {
+            self.by_source
+                .entry(imp.source.clone())
+                .or_insert_with(HashSet::new)
+                .insert(file.to_string());
+        }
+
+        // Update forward index
+        self.by_file.insert(file.to_string(), imports);
+    }
+
+    /// Remove all imports for a file, cleaning up the reverse index.
+    pub fn remove_file(&self, file: &str) {
+        if let Some((_, old_imports)) = self.by_file.remove(file) {
+            for imp in &old_imports {
+                if let Some(mut files) = self.by_source.get_mut(&imp.source) {
+                    files.remove(file);
+                    if files.is_empty() {
+                        drop(files);
+                        self.by_source.remove(&imp.source);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the imports for a specific file.
+    pub fn get_imports(&self, file: &str) -> Vec<ImportEntry> {
+        self.by_file
+            .get(file)
+            .map(|v| v.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Find files that import a given source string (exact match).
+    pub fn get_dependents_exact(&self, source: &str) -> Vec<String> {
+        self.by_source
+            .get(source)
+            .map(|v| {
+                let mut files: Vec<String> = v.iter().cloned().collect();
+                files.sort();
+                files
+            })
+            .unwrap_or_default()
+    }
+
+    /// Find files that import any source containing the given substring.
+    /// This enables fuzzy lookups like searching for "utils" to find files
+    /// importing "./utils", "../utils", "project/utils", etc.
+    pub fn get_dependents(&self, query: &str) -> Vec<String> {
+        let mut result_set = HashSet::new();
+        for entry in self.by_source.iter() {
+            if entry.key().contains(query) {
+                for file in entry.value().iter() {
+                    result_set.insert(file.clone());
+                }
+            }
+        }
+        let mut files: Vec<String> = result_set.into_iter().collect();
+        files.sort();
+        files
+    }
+
+    /// Return the total number of files with imports.
+    pub fn file_count(&self) -> usize {
+        self.by_file.len()
+    }
+
+    /// Return the total number of unique import sources.
+    pub fn source_count(&self) -> usize {
+        self.by_source.len()
     }
 }
 
@@ -561,5 +671,157 @@ mod tests {
         let result = table.get_unambiguous("src/foo.rs", "nonexistent", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    // ---- ImportTable tests ----
+
+    #[test]
+    fn test_import_table_insert_and_get() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/main.py",
+            vec![
+                ImportEntry { source: "os".to_string(), line: 1 },
+                ImportEntry { source: "sys".to_string(), line: 2 },
+            ],
+        );
+
+        let imports = table.get_imports("src/main.py");
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "os");
+        assert_eq!(imports[1].source, "sys");
+    }
+
+    #[test]
+    fn test_import_table_get_empty() {
+        let table = ImportTable::new();
+        let imports = table.get_imports("nonexistent.py");
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn test_import_table_reverse_index_exact() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/a.py",
+            vec![ImportEntry { source: "utils".to_string(), line: 1 }],
+        );
+        table.insert_file_imports(
+            "src/b.py",
+            vec![ImportEntry { source: "utils".to_string(), line: 1 }],
+        );
+        table.insert_file_imports(
+            "src/c.py",
+            vec![ImportEntry { source: "other".to_string(), line: 1 }],
+        );
+
+        let dependents = table.get_dependents_exact("utils");
+        assert_eq!(dependents.len(), 2);
+        assert!(dependents.contains(&"src/a.py".to_string()));
+        assert!(dependents.contains(&"src/b.py".to_string()));
+    }
+
+    #[test]
+    fn test_import_table_reverse_index_substring() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/a.ts",
+            vec![ImportEntry { source: "./utils/helpers".to_string(), line: 1 }],
+        );
+        table.insert_file_imports(
+            "src/b.ts",
+            vec![ImportEntry { source: "../utils".to_string(), line: 1 }],
+        );
+
+        let dependents = table.get_dependents("utils");
+        assert_eq!(dependents.len(), 2);
+    }
+
+    #[test]
+    fn test_import_table_remove_file_cleans_reverse_index() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/a.py",
+            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+        );
+        table.insert_file_imports(
+            "src/b.py",
+            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+        );
+
+        table.remove_file("src/a.py");
+
+        // Forward index should not have src/a.py
+        assert!(table.get_imports("src/a.py").is_empty());
+
+        // Reverse index should still have src/b.py
+        let dependents = table.get_dependents_exact("os");
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0], "src/b.py");
+    }
+
+    #[test]
+    fn test_import_table_remove_cleans_empty_source_entry() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/a.py",
+            vec![ImportEntry { source: "unique_module".to_string(), line: 1 }],
+        );
+
+        table.remove_file("src/a.py");
+
+        // The source entry should be fully removed since no files reference it
+        assert!(table.get_dependents_exact("unique_module").is_empty());
+        assert_eq!(table.source_count(), 0);
+    }
+
+    #[test]
+    fn test_import_table_insert_replaces_old_imports() {
+        let table = ImportTable::new();
+
+        // First insert
+        table.insert_file_imports(
+            "src/main.py",
+            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+        );
+        assert_eq!(table.get_imports("src/main.py").len(), 1);
+        assert_eq!(table.get_dependents_exact("os").len(), 1);
+
+        // Replace with new imports
+        table.insert_file_imports(
+            "src/main.py",
+            vec![ImportEntry { source: "sys".to_string(), line: 1 }],
+        );
+
+        // Old import "os" should be gone from reverse index
+        assert!(table.get_dependents_exact("os").is_empty());
+        // New import "sys" should be present
+        assert_eq!(table.get_dependents_exact("sys").len(), 1);
+        // Forward index should have only the new import
+        let imports = table.get_imports("src/main.py");
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "sys");
+    }
+
+    #[test]
+    fn test_import_table_counts() {
+        let table = ImportTable::new();
+        assert_eq!(table.file_count(), 0);
+        assert_eq!(table.source_count(), 0);
+
+        table.insert_file_imports(
+            "src/a.py",
+            vec![
+                ImportEntry { source: "os".to_string(), line: 1 },
+                ImportEntry { source: "sys".to_string(), line: 2 },
+            ],
+        );
+        table.insert_file_imports(
+            "src/b.py",
+            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+        );
+
+        assert_eq!(table.file_count(), 2);
+        assert_eq!(table.source_count(), 2); // "os" and "sys"
     }
 }

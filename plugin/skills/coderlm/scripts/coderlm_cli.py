@@ -480,6 +480,18 @@ def cmd_stats(args: argparse.Namespace) -> None:
         print("No impl/peek operations yet -- no savings to report.")
 
 
+def cmd_imports(args: argparse.Namespace) -> None:
+    """Show what a file imports (its dependencies)."""
+    state = _load_state()
+    _output(_get(state, "/imports", {"file": args.file}))
+
+
+def cmd_dependents(args: argparse.Namespace) -> None:
+    """Show which files import from / depend on a given module."""
+    state = _load_state()
+    _output(_get(state, "/dependents", {"file": args.file}))
+
+
 def cmd_ready(args: argparse.Namespace) -> None:
     """Check or wait for symbol extraction readiness."""
     state = _load_state()
@@ -666,6 +678,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats = sub.add_parser("stats", help="Show token savings telemetry for this session")
     p_stats.add_argument("--json", action="store_true", help="Output raw JSON instead of human-readable summary")
     p_stats.set_defaults(func=cmd_stats)
+
+    # imports
+    p_imports = sub.add_parser("imports", help="Show what a file imports (dependencies)")
+    p_imports.add_argument("file", help="Relative file path")
+    p_imports.set_defaults(func=cmd_imports)
+
+    # dependents
+    p_dependents = sub.add_parser("dependents", help="Show files that import from a given module")
+    p_dependents.add_argument("file", help="Module/file path to search for (substring match)")
+    p_dependents.set_defaults(func=cmd_dependents)
 
     # ready
     p_ready = sub.add_parser("ready", help="Check if symbol extraction is complete")

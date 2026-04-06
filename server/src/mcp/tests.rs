@@ -176,7 +176,21 @@ fn test_outline_tool_registered() {
 }
 
 #[test]
-fn test_all_ten_tools_have_attributes() {
+fn test_imports_tool_registered() {
+    let attr = CoderlmMcpServer::coderlm_imports_tool_attr();
+    assert_eq!(attr.name, "coderlm_imports");
+    assert!(attr.annotations.as_ref().unwrap().read_only_hint == Some(true));
+}
+
+#[test]
+fn test_dependents_tool_registered() {
+    let attr = CoderlmMcpServer::coderlm_dependents_tool_attr();
+    assert_eq!(attr.name, "coderlm_dependents");
+    assert!(attr.annotations.as_ref().unwrap().read_only_hint == Some(true));
+}
+
+#[test]
+fn test_all_twelve_tools_have_attributes() {
     // Verify each tool attribute function exists and produces the right name.
     let expected = vec![
         CoderlmMcpServer::coderlm_structure_tool_attr().name,
@@ -188,9 +202,11 @@ fn test_all_ten_tools_have_attributes() {
         CoderlmMcpServer::coderlm_tests_tool_attr().name,
         CoderlmMcpServer::coderlm_symbols_tool_attr().name,
         CoderlmMcpServer::coderlm_outline_tool_attr().name,
+        CoderlmMcpServer::coderlm_imports_tool_attr().name,
+        CoderlmMcpServer::coderlm_dependents_tool_attr().name,
         CoderlmMcpServer::coderlm_stats_tool_attr().name,
     ];
-    assert_eq!(expected.len(), 10, "Expected 10 tool attributes");
+    assert_eq!(expected.len(), 12, "Expected 12 tool attributes");
 
     let names: Vec<&str> = expected.iter().map(|s| s.as_ref()).collect();
     assert!(names.contains(&"coderlm_structure"));
@@ -202,6 +218,8 @@ fn test_all_ten_tools_have_attributes() {
     assert!(names.contains(&"coderlm_tests"));
     assert!(names.contains(&"coderlm_symbols"));
     assert!(names.contains(&"coderlm_outline"));
+    assert!(names.contains(&"coderlm_imports"));
+    assert!(names.contains(&"coderlm_dependents"));
     assert!(names.contains(&"coderlm_stats"));
 }
 

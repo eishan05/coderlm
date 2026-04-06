@@ -64,12 +64,19 @@ pub const VARIABLES_QUERY: &str = r#"
   pattern: (identifier) @var.name)
 "#;
 
+pub const IMPORTS_QUERY: &str = r#"
+(import_statement
+  source: (string
+    (string_fragment) @import.source))
+"#;
+
 pub fn config() -> LanguageConfig {
     LanguageConfig {
         language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         symbols_query: SYMBOLS_QUERY,
         callers_query: CALLERS_QUERY,
         variables_query: VARIABLES_QUERY,
+        imports_query: IMPORTS_QUERY,
         test_patterns: vec![
             TestPattern::CallExpression("it"),
             TestPattern::CallExpression("test"),
@@ -128,12 +135,19 @@ pub const JS_VARIABLES_QUERY: &str = r#"
   (identifier) @var.name)
 "#;
 
+pub const JS_IMPORTS_QUERY: &str = r#"
+(import_statement
+  source: (string
+    (string_fragment) @import.source))
+"#;
+
 pub fn js_config() -> LanguageConfig {
     LanguageConfig {
         language: tree_sitter_javascript::LANGUAGE.into(),
         symbols_query: JS_SYMBOLS_QUERY,
         callers_query: JS_CALLERS_QUERY,
         variables_query: JS_VARIABLES_QUERY,
+        imports_query: JS_IMPORTS_QUERY,
         test_patterns: vec![
             TestPattern::CallExpression("it"),
             TestPattern::CallExpression("test"),

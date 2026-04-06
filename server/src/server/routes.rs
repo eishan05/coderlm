@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::ops::{annotations, content, history, structure, symbol_ops};
+use crate::ops::{annotations, content, history, imports, structure, symbol_ops};
 use crate::server::errors::AppError;
 use crate::server::session::Session;
 use crate::server::state::{AppState, Project};
@@ -140,6 +140,9 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/symbols/callers/batch", post(batch_callers))
         .route("/api/v1/symbols/variables", get(list_variables))
         .route("/api/v1/symbols/outline", get(symbols_outline))
+        // Imports
+        .route("/api/v1/imports", get(get_file_imports))
+        .route("/api/v1/dependents", get(get_file_dependents))
         // Content
         .route("/api/v1/peek", get(peek))
         .route("/api/v1/grep", get(grep_handler))
@@ -1087,6 +1090,54 @@ async fn load_annotations(
     });
     record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/load", "loaded");
     Ok(Json(json!({ "ok": true, "loaded": summary })))
+}
+
+// ---------------------------------------------------------------------------
+// Imports
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportsQuery {
+    file: String,
+}
+
+async fn get_file_imports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ImportsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    let result = imports::get_imports(&project.import_table, &params.file);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "GET",
+        "/imports",
+        &format!("file={}", params.file),
+    );
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct DependentsQuery {
+    file: String,
+}
+
+async fn get_file_dependents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<DependentsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    let result = imports::get_dependents(&project.import_table, &params.file);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "GET",
+        "/dependents",
+        &format!("file={}", params.file),
+    );
+    Ok(Json(result))
 }
 
 // ---------------------------------------------------------------------------

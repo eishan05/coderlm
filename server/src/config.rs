@@ -45,6 +45,23 @@ pub const DEFAULT_IGNORE_EXTENSIONS: &[&str] = &[
 /// are still listed in the tree but are not parsed for symbols.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_000_000; // 1 MB
 
+/// Filename for project-specific ignore patterns (gitignore-style syntax).
+/// Placed in the project root alongside `.gitignore`.
+pub const CODERLM_IGNORE_FILENAME: &str = ".coderlmignore";
+
+/// Load a `.coderlmignore` file from the project root, returning a `Gitignore`
+/// matcher.  If the file does not exist or is unreadable the returned matcher
+/// is empty (matches nothing).
+pub fn load_coderlm_ignore(root: &std::path::Path) -> ignore::gitignore::Gitignore {
+    let ignore_path = root.join(CODERLM_IGNORE_FILENAME);
+    if ignore_path.is_file() {
+        let (gi, _err) = ignore::gitignore::Gitignore::new(&ignore_path);
+        gi
+    } else {
+        ignore::gitignore::Gitignore::empty()
+    }
+}
+
 pub fn should_ignore_dir(name: &str) -> bool {
     DEFAULT_IGNORE_DIRS.iter().any(|&d| d == name)
 }

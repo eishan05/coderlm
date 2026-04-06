@@ -17,6 +17,7 @@ pub fn scan_directory(root: &Path, file_tree: &Arc<FileTree>, max_file_size: u64
         .git_ignore(true) // respect .gitignore
         .git_global(true)
         .git_exclude(true)
+        .add_custom_ignore_filename(config::CODERLM_IGNORE_FILENAME)
         .build();
 
     let mut count = 0;
@@ -165,5 +166,115 @@ mod tests {
 
         let entry = file_tree.get("exact.rs").unwrap();
         assert!(!entry.oversized, "file exactly at limit should not be flagged oversized");
+    }
+
+    // ---- Tests for .coderlmignore support ----
+
+    #[test]
+    fn test_coderlmignore_excludes_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a .coderlmignore that excludes the "generated/" directory
+        std::fs::write(
+            dir.path().join(config::CODERLM_IGNORE_FILENAME),
+            "generated/\n",
+        ).unwrap();
+
+        // Create files: one inside generated/, one outside
+        let gen_dir = dir.path().join("generated");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(gen_dir.join("proto.rs"), "// generated").unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        assert!(file_tree.get("src.rs").is_some(), "Non-ignored file should be indexed");
+        assert!(file_tree.get("generated/proto.rs").is_none(),
+            "File in .coderlmignore'd directory should not be indexed");
+    }
+
+    #[test]
+    fn test_coderlmignore_glob_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(config::CODERLM_IGNORE_FILENAME),
+            "*.pb.go\n",
+        ).unwrap();
+
+        std::fs::write(dir.path().join("service.pb.go"), "package api").unwrap();
+        std::fs::write(dir.path().join("service.go"), "package api").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        assert!(file_tree.get("service.go").is_some(), "Non-matching file should be indexed");
+        assert!(file_tree.get("service.pb.go").is_none(),
+            "File matching .coderlmignore glob should not be indexed");
+    }
+
+    #[test]
+    fn test_coderlmignore_negation_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ignore all .snap files except important.snap
+        std::fs::write(
+            dir.path().join(config::CODERLM_IGNORE_FILENAME),
+            "*.snap\n!important.snap\n",
+        ).unwrap();
+
+        std::fs::write(dir.path().join("important.snap"), "keep this").unwrap();
+        std::fs::write(dir.path().join("junk.snap"), "discard this").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        assert!(file_tree.get("important.snap").is_some(),
+            "Negated file should be indexed");
+        assert!(file_tree.get("junk.snap").is_none(),
+            "Non-negated file matching ignore glob should not be indexed");
+        assert!(file_tree.get("lib.rs").is_some(),
+            "Unrelated file should be indexed");
+    }
+
+    #[test]
+    fn test_no_coderlmignore_indexes_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .coderlmignore file
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
+
+        let generated_dir = dir.path().join("mydir");
+        std::fs::create_dir_all(&generated_dir).unwrap();
+        std::fs::write(generated_dir.join("file.rs"), "fn f() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        assert!(file_tree.get("src.rs").is_some());
+        assert!(file_tree.get("mydir/file.rs").is_some(),
+            "Without .coderlmignore all non-gitignored files should be indexed");
+    }
+
+    #[test]
+    fn test_coderlmignore_multiple_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(config::CODERLM_IGNORE_FILENAME),
+            "# Comment line\nfixtures/\n*.snap\n",
+        ).unwrap();
+
+        let fixtures_dir = dir.path().join("fixtures");
+        std::fs::create_dir_all(&fixtures_dir).unwrap();
+        std::fs::write(fixtures_dir.join("data.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("output.snap"), "snapshot").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        assert!(file_tree.get("lib.rs").is_some(), "Normal file should be indexed");
+        assert!(file_tree.get("fixtures/data.json").is_none(),
+            "File in ignored directory should not be indexed");
+        assert!(file_tree.get("output.snap").is_none(),
+            "File matching ignored glob should not be indexed");
     }
 }

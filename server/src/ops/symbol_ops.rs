@@ -773,6 +773,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         }
     }
 
@@ -794,6 +795,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators,
+            doc_comment: None,
         }
     }
 
@@ -832,6 +834,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         };
         assert!(
             is_test_symbol(&sym, Some(source)),
@@ -1006,6 +1009,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         };
         assert!(
             is_test_symbol(&sym, Some(source)),
@@ -1106,6 +1110,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         };
         assert!(
             is_test_symbol(&sym, Some(source)),
@@ -1207,6 +1212,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         };
         assert!(matches_test_pattern(
             &TestPattern::Attribute("Test"),
@@ -1290,6 +1296,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         });
         symbol_table.insert(Symbol {
             name: "Foo".to_string(),
@@ -1302,6 +1309,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         });
 
         let outline = generate_outline(
@@ -1388,6 +1396,7 @@ mod tests {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         });
         symbol_table.insert(Symbol {
             name: "bar".to_string(),
@@ -1400,6 +1409,7 @@ mod tests {
             definition: None,
             parent: Some("Foo".to_string()),
             decorators: Vec::new(),
+            doc_comment: None,
         });
 
         let outline = generate_outline(

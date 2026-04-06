@@ -58,4 +58,10 @@ pub struct Symbol {
     /// Only populated for languages that support decorators (currently Python).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decorators: Vec<String>,
+    /// Documentation comment attached to this symbol (e.g. `///` in Rust,
+    /// `"""..."""` docstrings in Python, `/** ... */` in Java/TS/JS/Scala,
+    /// `//` in Go). Gives agents context about a symbol without reading
+    /// the full file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_comment: Option<String>,
 }

@@ -36,6 +36,179 @@ pub fn extract_symbols_from_file_with_hash(
     Ok((symbols, content_hash))
 }
 
+/// Extract the doc comment attached to a symbol node, if any.
+///
+/// For most languages, doc comments are sibling nodes immediately preceding the
+/// definition. For Python, the docstring is the first `expression_statement`
+/// child of the function/class body containing a `string` node.
+///
+/// `outer_node` is the full match node (e.g. `decorated_definition` if present),
+/// used for walking siblings. `identity_node` is the inner definition node,
+/// used for Python docstring extraction from the body.
+fn extract_doc_comment(
+    outer_node: tree_sitter::Node,
+    identity_node: tree_sitter::Node,
+    language: Language,
+    source: &str,
+) -> Option<String> {
+    // For Python, extract docstrings from the function/class body
+    if language == Language::Python {
+        return extract_python_docstring(identity_node, source);
+    }
+
+    // For all other languages, collect comment siblings preceding the node
+    let comment_lines = collect_preceding_comments(outer_node, language, source);
+    if comment_lines.is_empty() {
+        return None;
+    }
+
+    let joined = comment_lines.join("\n");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// Collect consecutive comment nodes immediately preceding a tree-sitter node.
+///
+/// Walks backward through previous siblings, skipping blank lines and attribute
+/// nodes (e.g. Rust `#[...]`), collecting comment nodes. Only collects comments
+/// that are "doc-style" for the given language:
+/// - Rust: `///`, `//!`, `/** */`
+/// - Java/Scala: `/** */`
+/// - TypeScript/JavaScript: `/** */`
+/// - Go: `//` directly preceding (Go convention)
+fn collect_preceding_comments(
+    node: tree_sitter::Node,
+    language: Language,
+    source: &str,
+) -> Vec<String> {
+    let mut comments = Vec::new();
+    let mut current = node;
+
+    // Walk backwards through previous siblings
+    while let Some(prev) = current.prev_sibling() {
+        let kind = prev.kind();
+        let text = prev.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+
+        match kind {
+            // Rust line comments
+            "line_comment" if language == Language::Rust => {
+                if text.starts_with("///") || text.starts_with("//!") {
+                    comments.push(text);
+                } else {
+                    break;
+                }
+            }
+            // Rust block comments
+            "block_comment" if language == Language::Rust => {
+                if text.starts_with("/**") || text.starts_with("/*!") {
+                    comments.push(text);
+                } else {
+                    break;
+                }
+            }
+            // Java/Scala block comments (Javadoc-style)
+            "block_comment"
+                if language == Language::Java || language == Language::Scala =>
+            {
+                if text.starts_with("/**") {
+                    comments.push(text);
+                } else {
+                    break;
+                }
+            }
+            // Java/Scala line comments are NOT doc comments
+            "line_comment"
+                if language == Language::Java || language == Language::Scala =>
+            {
+                break;
+            }
+            // TypeScript/JavaScript block comments (JSDoc-style)
+            "comment"
+                if language == Language::TypeScript || language == Language::JavaScript =>
+            {
+                if text.starts_with("/**") {
+                    comments.push(text);
+                } else {
+                    break;
+                }
+            }
+            // Go line comments (// directly preceding is idiomatic Go doc)
+            "comment" if language == Language::Go => {
+                if text.starts_with("//") {
+                    comments.push(text);
+                } else {
+                    break;
+                }
+            }
+            // Skip attribute nodes (e.g. Rust #[...], Java @annotations)
+            "attribute_item" | "attribute" | "marker_annotation" | "annotation" => {
+                current = prev;
+                continue;
+            }
+            // Skip empty/whitespace-only nodes
+            _ if text.is_empty() => {
+                current = prev;
+                continue;
+            }
+            // Any other node type — stop
+            _ => break,
+        }
+
+        current = prev;
+    }
+
+    // Reverse so comments appear in source order (top to bottom)
+    comments.reverse();
+    comments
+}
+
+/// Extract a Python docstring from a function or class definition node.
+///
+/// Python docstrings are the first `expression_statement` in the body of a
+/// `function_definition` or `class_definition`, where the expression is a
+/// `string` node whose text starts with `"""` or `'''`.
+fn extract_python_docstring(
+    identity_node: tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    // Find the body node
+    let mut cursor = identity_node.walk();
+    let body = identity_node.children(&mut cursor).find(|c| c.kind() == "block")?;
+
+    // Find the first expression_statement child of the body
+    let mut body_cursor = body.walk();
+    for child in body.children(&mut body_cursor) {
+        if child.kind() == "expression_statement" {
+            // Check if this expression_statement contains a string node
+            let mut expr_cursor = child.walk();
+            for expr_child in child.children(&mut expr_cursor) {
+                if expr_child.kind() == "string" || expr_child.kind() == "concatenated_string" {
+                    let text = expr_child.utf8_text(source.as_bytes()).unwrap_or("");
+                    let trimmed = text.trim();
+                    if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            // The first expression_statement was not a docstring; stop looking
+            break;
+        }
+        // Skip `pass` or other non-expression statements, but only if
+        // we haven't found the first expression_statement yet.
+        // Actually, a docstring must be the *first statement* in the body.
+        // In tree-sitter, comments/whitespace are not statement nodes,
+        // so the first non-comment child should be the docstring if present.
+        if child.kind() != "comment" {
+            break;
+        }
+    }
+
+    None
+}
+
 /// Extract symbols from source code string.
 fn extract_symbols_from_source(
     source: &str,
@@ -272,6 +445,9 @@ fn extract_symbols_from_source(
             let id_text = identity_node.utf8_text(source.as_bytes()).unwrap_or("");
             let signature = id_text.lines().next().unwrap_or("").to_string();
 
+            // Extract doc comment preceding the symbol
+            let doc_comment = extract_doc_comment(node, identity_node, language, source);
+
             symbols.push(Symbol {
                 name,
                 kind,
@@ -283,6 +459,7 @@ fn extract_symbols_from_source(
                 definition: None,
                 parent,
                 decorators,
+                doc_comment,
             });
         }
     }
@@ -1307,6 +1484,7 @@ impl Foo {
             definition: None,
             parent: None,
             decorators: vec!["@app.route(\"/api/test\")".to_string(), "@login_required".to_string()],
+            doc_comment: None,
         };
 
         let json = serde_json::to_string(&sym).unwrap();
@@ -1331,6 +1509,7 @@ impl Foo {
             definition: None,
             parent: None,
             decorators: Vec::new(),
+            doc_comment: None,
         };
 
         let json_no_dec = serde_json::to_string(&sym_no_dec).unwrap();
@@ -1842,6 +2021,452 @@ const (
             names.contains(&"replaced_function_with_longer_name"),
             "Should have re-extracted symbols from changed file, got: {:?}",
             names
+        );
+    }
+
+    // ── Doc comment extraction tests ──────────────────────────────────
+
+    #[test]
+    fn test_rust_doc_comment_triple_slash() {
+        let source = r#"
+/// This function does something important.
+/// It has multiple lines.
+fn documented() {}
+
+fn undocumented() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+
+        let doc = symbols.iter().find(|s| s.name == "documented").unwrap();
+        assert!(
+            doc.doc_comment.is_some(),
+            "Expected doc_comment for 'documented', got None"
+        );
+        let comment = doc.doc_comment.as_ref().unwrap();
+        assert!(
+            comment.contains("This function does something important"),
+            "Doc comment should contain the text, got: {}",
+            comment
+        );
+        assert!(
+            comment.contains("multiple lines"),
+            "Doc comment should contain second line, got: {}",
+            comment
+        );
+
+        let undoc = symbols.iter().find(|s| s.name == "undocumented").unwrap();
+        assert!(
+            undoc.doc_comment.is_none(),
+            "Expected no doc_comment for 'undocumented'"
+        );
+    }
+
+    #[test]
+    fn test_rust_doc_comment_inner_not_captured_as_regular() {
+        // Regular comments (non-doc) should NOT be captured
+        let source = r#"
+// This is a regular comment, not a doc comment.
+fn regular_comment() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "regular_comment").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Regular // comments should NOT be captured as doc comments"
+        );
+    }
+
+    #[test]
+    fn test_rust_doc_comment_block_style() {
+        let source = r#"
+/** This is a block doc comment. */
+fn block_documented() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "block_documented").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for block-style doc comment"
+        );
+        let comment = sym.doc_comment.as_ref().unwrap();
+        assert!(
+            comment.contains("block doc comment"),
+            "Doc comment should contain the text, got: {}",
+            comment
+        );
+    }
+
+    #[test]
+    fn test_rust_doc_comment_on_struct() {
+        let source = r#"
+/// A point in 2D space.
+struct Point {
+    x: f64,
+    y: f64,
+}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "Point").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for struct Point"
+        );
+        assert!(
+            sym.doc_comment.as_ref().unwrap().contains("2D space"),
+            "Doc comment should contain '2D space'"
+        );
+    }
+
+    #[test]
+    fn test_python_docstring_function() {
+        let source = r#"
+def greet(name):
+    """Greet someone by name.
+
+    Args:
+        name: The person's name.
+    """
+    print(f"Hello, {name}")
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for 'greet'"
+        );
+        let comment = sym.doc_comment.as_ref().unwrap();
+        assert!(
+            comment.contains("Greet someone by name"),
+            "Docstring should contain the text, got: {}",
+            comment
+        );
+    }
+
+    #[test]
+    fn test_python_docstring_class() {
+        let source = r#"
+class MyClass:
+    """A sample class with documentation."""
+
+    def method(self):
+        pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+        let cls = symbols.iter().find(|s| s.name == "MyClass" && s.kind == SymbolKind::Class).unwrap();
+        assert!(
+            cls.doc_comment.is_some(),
+            "Expected doc_comment for class 'MyClass'"
+        );
+        assert!(
+            cls.doc_comment.as_ref().unwrap().contains("sample class"),
+            "Docstring should contain 'sample class'"
+        );
+    }
+
+    #[test]
+    fn test_python_no_docstring() {
+        let source = r#"
+def no_docs():
+    x = 42
+    return x
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "no_docs").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Expected no doc_comment for function without docstring"
+        );
+    }
+
+    #[test]
+    fn test_python_single_quote_docstring() {
+        let source = r#"
+def single_quoted():
+    '''Single-quoted docstring.'''
+    pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "single_quoted").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for single-quoted docstring"
+        );
+        assert!(
+            sym.doc_comment.as_ref().unwrap().contains("Single-quoted docstring"),
+            "Should capture single-quoted docstrings"
+        );
+    }
+
+    #[test]
+    fn test_java_javadoc_comment() {
+        let source = r#"
+/**
+ * A utility class for string operations.
+ */
+public class StringUtils {
+    /**
+     * Reverses a string.
+     * @param s the input string
+     * @return the reversed string
+     */
+    public String reverse(String s) {
+        return new StringBuilder(s).reverse().toString();
+    }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+
+        let cls = symbols.iter().find(|s| s.name == "StringUtils" && s.kind == SymbolKind::Class).unwrap();
+        assert!(
+            cls.doc_comment.is_some(),
+            "Expected doc_comment for class 'StringUtils'"
+        );
+        assert!(
+            cls.doc_comment.as_ref().unwrap().contains("utility class"),
+            "Class doc comment should contain 'utility class'"
+        );
+
+        let method = symbols.iter().find(|s| s.name == "reverse" && s.kind == SymbolKind::Method).unwrap();
+        assert!(
+            method.doc_comment.is_some(),
+            "Expected doc_comment for method 'reverse'"
+        );
+        assert!(
+            method.doc_comment.as_ref().unwrap().contains("Reverses a string"),
+            "Method doc comment should contain 'Reverses a string'"
+        );
+    }
+
+    #[test]
+    fn test_java_regular_comment_not_captured() {
+        let source = r#"
+// This is a regular comment
+public class Foo {
+    public void bar() {}
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+        let cls = symbols.iter().find(|s| s.name == "Foo").unwrap();
+        assert!(
+            cls.doc_comment.is_none(),
+            "Regular // comments should NOT be captured as doc comments for Java"
+        );
+    }
+
+    #[test]
+    fn test_go_doc_comment() {
+        let source = r#"
+package main
+
+// Add returns the sum of two integers.
+// It is used for basic arithmetic.
+func Add(a, b int) int {
+    return a + b
+}
+
+func Undocumented() {}
+"#;
+        let symbols = extract_from_source(source, Language::Go);
+
+        let add = symbols.iter().find(|s| s.name == "Add").unwrap();
+        assert!(
+            add.doc_comment.is_some(),
+            "Expected doc_comment for 'Add'"
+        );
+        let comment = add.doc_comment.as_ref().unwrap();
+        assert!(
+            comment.contains("returns the sum"),
+            "Doc comment should contain 'returns the sum', got: {}",
+            comment
+        );
+
+        let undoc = symbols.iter().find(|s| s.name == "Undocumented").unwrap();
+        assert!(
+            undoc.doc_comment.is_none(),
+            "Expected no doc_comment for 'Undocumented'"
+        );
+    }
+
+    #[test]
+    fn test_typescript_jsdoc_comment() {
+        let source = r#"
+/**
+ * Adds two numbers together.
+ * @param a - First number
+ * @param b - Second number
+ * @returns The sum
+ */
+function add(a: number, b: number): number {
+    return a + b;
+}
+
+function plain() {}
+"#;
+        let symbols = extract_from_source(source, Language::TypeScript);
+
+        let add = symbols.iter().find(|s| s.name == "add").unwrap();
+        assert!(
+            add.doc_comment.is_some(),
+            "Expected doc_comment for 'add'"
+        );
+        let comment = add.doc_comment.as_ref().unwrap();
+        assert!(
+            comment.contains("Adds two numbers"),
+            "Doc comment should contain 'Adds two numbers', got: {}",
+            comment
+        );
+
+        let plain = symbols.iter().find(|s| s.name == "plain").unwrap();
+        assert!(
+            plain.doc_comment.is_none(),
+            "Expected no doc_comment for 'plain'"
+        );
+    }
+
+    #[test]
+    fn test_javascript_jsdoc_comment() {
+        let source = r#"
+/**
+ * Formats a greeting message.
+ * @param {string} name - The name to greet.
+ * @returns {string} The greeting.
+ */
+function greet(name) {
+    return `Hello, ${name}!`;
+}
+"#;
+        let symbols = extract_from_source(source, Language::JavaScript);
+        let sym = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for 'greet'"
+        );
+        assert!(
+            sym.doc_comment.as_ref().unwrap().contains("Formats a greeting"),
+            "Doc comment should contain 'Formats a greeting'"
+        );
+    }
+
+    #[test]
+    fn test_scala_scaladoc_comment() {
+        let source = r#"
+/**
+ * A case class representing a person.
+ * @param name the person's name
+ * @param age the person's age
+ */
+class Person(val name: String, val age: Int)
+
+def helper(): Unit = {}
+"#;
+        let symbols = extract_from_source(source, Language::Scala);
+        let cls = symbols.iter().find(|s| s.name == "Person" && s.kind == SymbolKind::Class).unwrap();
+        assert!(
+            cls.doc_comment.is_some(),
+            "Expected doc_comment for class 'Person'"
+        );
+        assert!(
+            cls.doc_comment.as_ref().unwrap().contains("case class representing"),
+            "Scaladoc should contain 'case class representing'"
+        );
+    }
+
+    #[test]
+    fn test_doc_comment_none_for_symbols_without_comments() {
+        // Quick smoke test: symbols without preceding comments get None
+        let source = r#"
+fn alpha() {}
+fn beta() {}
+fn gamma() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        for sym in &symbols {
+            assert!(
+                sym.doc_comment.is_none(),
+                "Symbol '{}' should have no doc_comment",
+                sym.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_doc_comment_serde_skip_when_none() {
+        // Verify that doc_comment: None is not serialized in JSON
+        let sym = Symbol {
+            name: "test".to_string(),
+            kind: SymbolKind::Function,
+            file: "test.rs".to_string(),
+            byte_range: (0, 10),
+            line_range: (1, 1),
+            language: Language::Rust,
+            signature: "fn test()".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+            doc_comment: None,
+        };
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(
+            !json.contains("doc_comment"),
+            "JSON should NOT contain 'doc_comment' when None (skip_serializing_if)"
+        );
+
+        // But it should be present when Some
+        let sym_with_doc = Symbol {
+            doc_comment: Some("A test function.".to_string()),
+            ..sym
+        };
+        let json_with_doc = serde_json::to_string(&sym_with_doc).unwrap();
+        assert!(
+            json_with_doc.contains("doc_comment"),
+            "JSON should contain 'doc_comment' when present"
+        );
+        assert!(
+            json_with_doc.contains("A test function."),
+            "JSON should contain the doc comment text"
+        );
+    }
+
+    #[test]
+    fn test_rust_doc_comment_with_attribute() {
+        // Doc comments should work even when there's an attribute between
+        // the comment and the function (e.g. #[derive(...)])
+        let source = r#"
+/// A configuration struct.
+#[derive(Debug, Clone)]
+struct Config {
+    name: String,
+}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for 'Config' even with #[derive(...)] attribute"
+        );
+        assert!(
+            sym.doc_comment.as_ref().unwrap().contains("configuration struct"),
+            "Doc comment should contain 'configuration struct'"
+        );
+    }
+
+    #[test]
+    fn test_python_decorated_function_with_docstring() {
+        let source = r#"
+@app.route("/api")
+def api_handler():
+    """Handle API requests."""
+    return "ok"
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "api_handler").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for decorated function with docstring"
+        );
+        assert!(
+            sym.doc_comment.as_ref().unwrap().contains("Handle API requests"),
+            "Docstring should contain 'Handle API requests'"
         );
     }
 }

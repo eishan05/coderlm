@@ -4,6 +4,7 @@ use clap::Parser;
 use tracing::info;
 
 use coderlm_server::config;
+use coderlm_server::mcp::server::CoderlmMcpServer;
 use coderlm_server::server;
 use coderlm_server::server::state::AppState;
 
@@ -37,21 +38,17 @@ enum Commands {
         /// Maximum number of concurrent indexed projects
         #[arg(long, default_value = "5")]
         max_projects: usize,
+
+        /// Start as an MCP (Model Context Protocol) server over stdio
+        /// instead of the HTTP server. The project to index is taken
+        /// from `path` or the current working directory.
+        #[arg(long)]
+        mcp: bool,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    info!("coderlm v{}", env!("CARGO_PKG_VERSION"));
-
     let cli = Cli::parse();
 
     match cli.command {
@@ -61,8 +58,24 @@ async fn main() -> anyhow::Result<()> {
             bind,
             max_file_size,
             max_projects,
+            mcp,
         } => {
-            run_server(path, port, bind, max_file_size, max_projects).await?;
+            if mcp {
+                run_mcp_server(path, max_file_size, max_projects).await?;
+            } else {
+                // Initialize tracing only for the HTTP server.
+                // For MCP mode, stdout is the transport — tracing to stdout
+                // would corrupt the JSON-RPC stream.
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+                    .init();
+
+                info!("coderlm v{}", env!("CARGO_PKG_VERSION"));
+                run_server(path, port, bind, max_file_size, max_projects).await?;
+            }
         }
     }
 
@@ -101,5 +114,53 @@ async fn run_server(
 
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+async fn run_mcp_server(
+    path: Option<PathBuf>,
+    max_file_size: u64,
+    max_projects: usize,
+) -> anyhow::Result<()> {
+    // For MCP mode, initialise tracing to stderr so it doesn't corrupt
+    // the JSON-RPC stream on stdout.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    info!("coderlm MCP server v{}", env!("CARGO_PKG_VERSION"));
+
+    // Determine the project directory
+    let cwd = match path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+
+    info!("MCP server indexing project: {}", cwd.display());
+
+    let state = AppState::new(max_projects, max_file_size);
+    let mcp_server = CoderlmMcpServer::new(state, &cwd)
+        .map_err(|e| anyhow::anyhow!("Failed to create MCP server: {}", e))?;
+
+    info!("MCP server ready, waiting for client on stdio...");
+
+    // Start the MCP server on stdio
+    let transport = rmcp::transport::io::stdio();
+
+    let service = rmcp::ServiceExt::serve(mcp_server, transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {}", e))?;
+
+    // Wait for the service to complete (client disconnects or error)
+    service
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+
+    info!("MCP server shutting down");
     Ok(())
 }

@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use tracing::info;
 
+use crate::cache::CacheStore;
 use crate::index::file_tree::FileTree;
 use crate::index::{walker, watcher};
 use crate::ops::annotations;
@@ -60,16 +61,43 @@ pub struct AppStateInner {
     pub sessions: DashMap<String, Session>,
     pub max_projects: usize,
     pub max_file_size: u64,
+    pub cache: Option<Arc<CacheStore>>,
 }
 
 impl AppState {
     pub fn new(max_projects: usize, max_file_size: u64) -> Self {
+        // Try to open the persistent cache; log and continue if it fails
+        let cache = match CacheStore::open(&CacheStore::default_db_path()) {
+            Ok(store) => {
+                info!("Persistent cache opened at {}", CacheStore::default_db_path().display());
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open persistent cache: {}. Proceeding without cache.", e);
+                None
+            }
+        };
+
         Self {
             inner: Arc::new(AppStateInner {
                 projects: DashMap::new(),
                 sessions: DashMap::new(),
                 max_projects,
                 max_file_size,
+                cache,
+            }),
+        }
+    }
+
+    /// Create AppState with an explicit cache (for testing).
+    pub fn new_with_cache(max_projects: usize, max_file_size: u64, cache: Option<Arc<CacheStore>>) -> Self {
+        Self {
+            inner: Arc::new(AppStateInner {
+                projects: DashMap::new(),
+                sessions: DashMap::new(),
+                max_projects,
+                max_file_size,
+                cache,
             }),
         }
     }
@@ -138,9 +166,10 @@ impl AppState {
         let ft = file_tree;
         let st = symbol_table;
         let root = project.root.clone();
+        let cache = self.inner.cache.clone();
         tokio::spawn(async move {
             info!("Starting symbol extraction for {}...", root.display());
-            match parser::extract_all_symbols(&root, &ft, &st).await {
+            match parser::extract_all_symbols_cached(&root, &ft, &st, cache.as_ref()).await {
                 Ok(count) => {
                     info!("Extracted {} symbols for {}", count, root.display());
                     // Load annotations now that symbols are available.

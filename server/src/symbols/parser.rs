@@ -749,6 +749,8 @@ for i in range(10):
             "inner_local",
             "class_var",
             "nested_var",
+            "conditional_var",
+            "loop_var",
         ] {
             let found = symbols
                 .iter()

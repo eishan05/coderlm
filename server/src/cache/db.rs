@@ -32,8 +32,14 @@ fn dirs_cache_linux() -> PathBuf {
     PathBuf::from(cache_home).join("coderlm")
 }
 
+/// Current cache schema version. Bump this whenever the table schemas change.
+/// The cache is expendable data, so on version mismatch we simply drop and
+/// recreate all tables rather than running complex migrations.
+const CACHE_SCHEMA_VERSION: i64 = 2;
+
 /// Open (or create) the SQLite cache database at the given path.
 /// Creates parent directories if needed. Sets WAL mode for concurrent reads.
+/// If the DB has an older schema version, it drops and recreates all tables.
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -43,6 +49,23 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
     // Enable WAL mode for concurrent reads during server operation
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+    // Check schema version and migrate if needed.
+    // user_version is a SQLite pragma that persists an integer in the DB file.
+    let current_version: i64 = conn.query_row(
+        "PRAGMA user_version",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if current_version != CACHE_SCHEMA_VERSION {
+        // Schema changed — drop everything and recreate.
+        // This is safe because the cache is fully reconstructable from source files.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS file_index;
+             DROP TABLE IF EXISTS workspace_manifest;"
+        )?;
+    }
 
     // Create tables if they don't exist
     conn.execute_batch(
@@ -67,6 +90,9 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             PRIMARY KEY (workspace_id, rel_path)
         );"
     )?;
+
+    // Set the schema version so future opens know we're current
+    conn.execute_batch(&format!("PRAGMA user_version = {};", CACHE_SCHEMA_VERSION))?;
 
     Ok(conn)
 }
@@ -252,5 +278,70 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal", "WAL mode should be enabled for concurrent reads");
+    }
+
+    #[test]
+    fn test_schema_migration_drops_old_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+
+        // Create a DB with an old schema version (simulates pre-migration DB)
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE file_index (
+                    content_hash TEXT PRIMARY KEY,
+                    language TEXT NOT NULL,
+                    symbols_json TEXT NOT NULL,
+                    parser_version INTEGER NOT NULL,
+                    grammar_version TEXT NOT NULL,
+                    symbol_schema_version INTEGER NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+                );
+                PRAGMA user_version = 1;"  // old version
+            ).unwrap();
+            // Insert data that should be dropped on migration
+            conn.execute(
+                "INSERT INTO file_index VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+                rusqlite::params!["old_hash", "rust", "[]", 1, "v1", 1],
+            ).unwrap();
+        }
+
+        // Open with open_db — should detect version mismatch and recreate
+        let conn = open_db(&db_path).unwrap();
+
+        // Old data should be gone (tables were dropped and recreated)
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_index", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "Old data should be cleared after schema migration");
+
+        // New schema should have composite PK — verify by inserting same hash
+        // with different languages (would fail on old single-column PK)
+        conn.execute(
+            "INSERT INTO file_index VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+            rusqlite::params!["same_hash", "rust", "[]", 1, "v1", 1],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO file_index VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+            rusqlite::params!["same_hash", "python", "[]", 1, "v1", 1],
+        ).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_index", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "New schema should allow same hash with different languages");
+    }
+
+    #[test]
+    fn test_schema_version_is_set_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+
+        let conn = open_db(&db_path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CACHE_SCHEMA_VERSION);
     }
 }

@@ -108,6 +108,20 @@ pub fn extract_symbols_from_file(
                 "interface.def" => {
                     def_node = Some(cap.node);
                 }
+                "record.name" => {
+                    name = Some(text.to_string());
+                    kind = Some(SymbolKind::Class);
+                }
+                "record.def" => {
+                    def_node = Some(cap.node);
+                }
+                "constructor.name" => {
+                    name = Some(text.to_string());
+                    kind = Some(SymbolKind::Method);
+                }
+                "constructor.def" => {
+                    def_node = Some(cap.node);
+                }
                 "type.name" => {
                     name = Some(text.to_string());
                     kind = Some(SymbolKind::Type);
@@ -213,4 +227,117 @@ pub async fn extract_all_symbols(
     .await??;
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::file_entry::Language;
+    use crate::symbols::symbol::SymbolKind;
+    use std::io::Write;
+
+    /// Helper: write source to a temp file and extract symbols.
+    fn extract_from_source(source: &str, language: Language) -> Vec<Symbol> {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = match language {
+            Language::Java => "Test.java",
+            Language::Rust => "test.rs",
+            _ => "test.txt",
+        };
+        let file_path = dir.path().join(filename);
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(source.as_bytes()).unwrap();
+        drop(f);
+
+        extract_symbols_from_file(dir.path(), filename, language).unwrap()
+    }
+
+    #[test]
+    fn test_java_record_extracted_as_class() {
+        let source = r#"
+public record Point(int x, int y) {
+    public double distance() {
+        return Math.sqrt(x * x + y * y);
+    }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+        let record_sym = symbols.iter().find(|s| s.name == "Point");
+        assert!(
+            record_sym.is_some(),
+            "Expected to find a symbol named 'Point' for the Java record"
+        );
+        let record_sym = record_sym.unwrap();
+        assert_eq!(
+            record_sym.kind,
+            SymbolKind::Class,
+            "Java record should be mapped to SymbolKind::Class"
+        );
+    }
+
+    #[test]
+    fn test_java_constructor_extracted_as_method() {
+        let source = r#"
+public class Greeter {
+    private String name;
+
+    public Greeter(String name) {
+        this.name = name;
+    }
+
+    public String greet() {
+        return "Hello, " + name;
+    }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+        let ctor_sym = symbols.iter().find(|s| s.name == "Greeter" && s.kind == SymbolKind::Method);
+        assert!(
+            ctor_sym.is_some(),
+            "Expected to find a constructor named 'Greeter' with SymbolKind::Method"
+        );
+    }
+
+    #[test]
+    fn test_java_class_and_methods_still_extracted() {
+        let source = r#"
+public class Foo {
+    public void bar() {}
+    public int baz() { return 1; }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+        let class_sym = symbols.iter().find(|s| s.name == "Foo" && s.kind == SymbolKind::Class);
+        assert!(class_sym.is_some(), "Expected class Foo");
+
+        let method_bar = symbols.iter().find(|s| s.name == "bar" && s.kind == SymbolKind::Method);
+        assert!(method_bar.is_some(), "Expected method bar");
+
+        let method_baz = symbols.iter().find(|s| s.name == "baz" && s.kind == SymbolKind::Method);
+        assert!(method_baz.is_some(), "Expected method baz");
+    }
+
+    #[test]
+    fn test_java_record_with_constructor_and_methods() {
+        let source = r#"
+public record Person(String name, int age) {
+    public Person {
+        if (age < 0) throw new IllegalArgumentException();
+    }
+
+    public String greeting() {
+        return "Hi, I'm " + name;
+    }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+
+        // The record itself
+        let record = symbols.iter().find(|s| s.name == "Person" && s.kind == SymbolKind::Class);
+        assert!(record.is_some(), "Expected record Person as Class");
+
+        // The method inside the record
+        let method = symbols.iter().find(|s| s.name == "greeting" && s.kind == SymbolKind::Method);
+        assert!(method.is_some(), "Expected method greeting");
+    }
 }

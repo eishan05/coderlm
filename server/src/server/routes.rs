@@ -72,6 +72,42 @@ fn record_history(state: &AppState, session_id: Option<&str>, method: &str, path
     }
 }
 
+/// Record a symbol lookup (search, list, callers, tests, variables) for telemetry.
+fn record_symbol_lookup(state: &AppState, session_id: Option<&str>) {
+    if let Some(id) = session_id {
+        if let Some(session) = state.inner.sessions.get(id) {
+            session.stats.record_symbol_lookup();
+        }
+    }
+}
+
+/// Record a peek operation for telemetry with the chars served vs full file chars.
+fn record_peek_stats(state: &AppState, session_id: Option<&str>, chars_served: u64, full_file_chars: u64) {
+    if let Some(id) = session_id {
+        if let Some(session) = state.inner.sessions.get(id) {
+            session.stats.record_peek(chars_served, full_file_chars);
+        }
+    }
+}
+
+/// Record an impl operation for telemetry with the chars served vs full file chars.
+fn record_impl_stats(state: &AppState, session_id: Option<&str>, chars_served: u64, full_file_chars: u64) {
+    if let Some(id) = session_id {
+        if let Some(session) = state.inner.sessions.get(id) {
+            session.stats.record_impl(chars_served, full_file_chars);
+        }
+    }
+}
+
+/// Record a grep operation for telemetry.
+fn record_grep_stats(state: &AppState, session_id: Option<&str>) {
+    if let Some(id) = session_id {
+        if let Some(session) = state.inner.sessions.get(id) {
+            session.stats.record_grep();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -109,6 +145,8 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/chunk_indices", get(chunk_indices))
         // History
         .route("/api/v1/history", get(get_history))
+        // Stats
+        .route("/api/v1/stats", get(get_stats))
         // Annotations
         .route("/api/v1/annotations/save", post(save_annotations))
         .route("/api/v1/annotations/load", post(load_annotations))
@@ -404,8 +442,10 @@ async fn list_symbols(
         params.file.as_deref(),
         limit,
     );
+    let sid = session_id(&headers);
     let preview = format!("{} symbols", results.len());
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/symbols", &preview);
+    record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({ "symbols": results, "count": results.len(), "indexing_complete": indexing_complete })))
 }
 
@@ -426,8 +466,10 @@ async fn search_symbols(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(20);
     let result = symbol_ops::search_symbols(&project.symbol_table, &params.q, offset, limit);
+    let sid = session_id(&headers);
     let preview = format!("{} matches for '{}' (total {})", result.symbols.len(), params.q, result.total);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/search", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/symbols/search", &preview);
+    record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({
         "symbols": result.symbols,
         "count": result.symbols.len(),
@@ -506,8 +548,14 @@ async fn get_implementation(
         params.line,
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
+    let sid = session_id(&headers);
     let preview = format!("{}::{} ({} bytes)", params.file, params.symbol, source.len());
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/implementation", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/symbols/implementation", &preview);
+    // Track token savings: chars served (impl snippet) vs full file
+    let full_file_chars = project.file_tree.get(&params.file)
+        .map(|e| e.size)
+        .unwrap_or(source.len() as u64);
+    record_impl_stats(&state, sid.as_deref(), source.len() as u64, full_file_chars);
     Ok(Json(json!({
         "symbol": params.symbol,
         "file": params.file,
@@ -553,6 +601,8 @@ async fn batch_implementations(
     let mut results: Vec<Value> = Vec::with_capacity(body.symbols.len());
     let mut success_count = 0usize;
     let mut error_count = 0usize;
+    let mut total_chars_served: u64 = 0;
+    let mut total_chars_full_file: u64 = 0;
 
     for sym_ref in &body.symbols {
         match symbol_ops::get_implementation(
@@ -564,6 +614,11 @@ async fn batch_implementations(
         ) {
             Ok(source) => {
                 success_count += 1;
+                let full_file_chars = project.file_tree.get(&sym_ref.file)
+                    .map(|e| e.size)
+                    .unwrap_or(source.len() as u64);
+                total_chars_served += source.len() as u64;
+                total_chars_full_file += full_file_chars;
                 results.push(json!({
                     "symbol": sym_ref.symbol,
                     "file": sym_ref.file,
@@ -581,6 +636,7 @@ async fn batch_implementations(
         }
     }
 
+    let sid = session_id(&headers);
     let preview = format!(
         "batch impl: {} requested, {} ok, {} errors",
         body.symbols.len(),
@@ -589,11 +645,22 @@ async fn batch_implementations(
     );
     record_history(
         &state,
-        session_id(&headers).as_deref(),
+        sid.as_deref(),
         "POST",
         "/symbols/implementations/batch",
         &preview,
     );
+    // Track token savings: aggregate chars served vs full file for all successful impls
+    if total_chars_served > 0 {
+        if let Some(id) = sid.as_deref() {
+            if let Some(session) = state.inner.sessions.get(id) {
+                use std::sync::atomic::Ordering;
+                session.stats.impl_reads.fetch_add(success_count as u64, Ordering::Relaxed);
+                session.stats.chars_served.fetch_add(total_chars_served, Ordering::Relaxed);
+                session.stats.chars_full_file.fetch_add(total_chars_full_file, Ordering::Relaxed);
+            }
+        }
+    }
 
     Ok(Json(json!({
         "results": results,
@@ -631,8 +698,10 @@ async fn find_tests(
         params.line,
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
+    let sid = session_id(&headers);
     let preview = format!("{} tests for {}", tests.len(), params.symbol);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/tests", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/symbols/tests", &preview);
+    record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({ "tests": tests, "count": tests.len(), "indexing_complete": indexing_complete })))
 }
 
@@ -663,8 +732,10 @@ async fn find_callers(
         params.line,
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
+    let sid = session_id(&headers);
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/callers", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/symbols/callers", &preview);
+    record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({ "callers": callers, "count": callers.len(), "indexing_complete": indexing_complete })))
 }
 
@@ -738,6 +809,7 @@ async fn batch_callers(
         }
     }
 
+    let sid = session_id(&headers);
     let preview = format!(
         "batch callers: {} requested, {} ok, {} errors",
         body.symbols.len(),
@@ -746,11 +818,15 @@ async fn batch_callers(
     );
     record_history(
         &state,
-        session_id(&headers).as_deref(),
+        sid.as_deref(),
         "POST",
         "/symbols/callers/batch",
         &preview,
     );
+    // Each successful caller lookup counts as a symbol lookup
+    for _ in 0..success_count {
+        record_symbol_lookup(&state, sid.as_deref());
+    }
 
     Ok(Json(json!({
         "results": results,
@@ -784,8 +860,10 @@ async fn list_variables(
         params.line,
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
+    let sid = session_id(&headers);
     let preview = format!("{} variables in {}", vars.len(), params.function);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/variables", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/symbols/variables", &preview);
+    record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({ "variables": vars, "count": vars.len(), "indexing_complete": indexing_complete })))
 }
 
@@ -816,8 +894,14 @@ async fn peek(
         end,
     )
     .map_err(AppError::NotFound)?;
+    let sid = session_id(&headers);
     let preview = format!("{}:{}-{}", params.file, start, end);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/peek", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/peek", &preview);
+    // Track token savings: chars served (peek content) vs full file
+    let full_file_chars = project.file_tree.get(&params.file)
+        .map(|e| e.size)
+        .unwrap_or(result.content.len() as u64);
+    record_peek_stats(&state, sid.as_deref(), result.content.len() as u64, full_file_chars);
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
 
@@ -857,8 +941,10 @@ async fn grep_handler(
     .map_err(|e| AppError::Internal(e.to_string()))?
     .map_err(AppError::BadRequest)?;
 
+    let sid = session_id(&headers);
     let preview = format!("{} matches for '{}'", result.total_matches, params.pattern);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/grep", &preview);
+    record_history(&state, sid.as_deref(), "GET", "/grep", &preview);
+    record_grep_stats(&state, sid.as_deref());
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
 
@@ -964,4 +1050,22 @@ async fn load_annotations(
     });
     record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/load", "loaded");
     Ok(Json(json!({ "ok": true, "loaded": summary })))
+}
+
+// ---------------------------------------------------------------------------
+// Stats (token savings telemetry)
+// ---------------------------------------------------------------------------
+
+async fn get_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let sid = require_session(&headers)?;
+    let session = state
+        .inner
+        .sessions
+        .get(&sid)
+        .ok_or_else(|| AppError::NotFound(format!("Session '{}' not found", sid)))?;
+    let snapshot = session.stats.snapshot();
+    Ok(Json(serde_json::to_value(snapshot).unwrap()))
 }

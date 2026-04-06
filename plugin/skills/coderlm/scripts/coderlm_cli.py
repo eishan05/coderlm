@@ -26,6 +26,7 @@ Usage:
   python3 coderlm_cli.py save-annotations
   python3 coderlm_cli.py load-annotations
   python3 coderlm_cli.py history [--limit N]
+  python3 coderlm_cli.py stats [--json]
   python3 coderlm_cli.py status
   python3 coderlm_cli.py ready [--wait]
   python3 coderlm_cli.py cleanup
@@ -434,6 +435,44 @@ def cmd_load_annotations(args: argparse.Namespace) -> None:
     _output(_post(state, "/annotations/load", {}))
 
 
+def cmd_stats(args: argparse.Namespace) -> None:
+    """Show token savings telemetry for the current session."""
+    state = _load_state()
+    result = _get(state, "/stats")
+
+    if args.json:
+        _output(result)
+        return
+
+    # Human-readable summary
+    symbol_lookups = result.get("symbol_lookups", 0)
+    peek_reads = result.get("peek_reads", 0)
+    impl_reads = result.get("impl_reads", 0)
+    grep_ops = result.get("grep_ops", 0)
+    tokens_served = result.get("estimated_tokens_served", 0)
+    tokens_full_file = result.get("estimated_tokens_full_file", 0)
+    tokens_saved = result.get("estimated_tokens_saved", 0)
+
+    print(f"This session: {symbol_lookups} symbol lookups, "
+          f"{peek_reads} peek reads, {impl_reads} impl reads, "
+          f"{grep_ops} grep ops.")
+
+    if tokens_full_file > 0:
+        def _fmt_tokens(n: int) -> str:
+            if n >= 1_000_000:
+                return f"~{n / 1_000_000:.1f}M"
+            elif n >= 1_000:
+                return f"~{n / 1_000:.0f}k"
+            else:
+                return str(n)
+
+        print(f"Estimated savings: {_fmt_tokens(tokens_saved)} tokens "
+              f"(served {_fmt_tokens(tokens_served)} vs "
+              f"{_fmt_tokens(tokens_full_file)} full-file equivalent).")
+    else:
+        print("No impl/peek operations yet -- no savings to report.")
+
+
 def cmd_ready(args: argparse.Namespace) -> None:
     """Check or wait for symbol extraction readiness."""
     state = _load_state()
@@ -610,6 +649,11 @@ def build_parser() -> argparse.ArgumentParser:
     # load-annotations
     p_load = sub.add_parser("load-annotations", help="Load annotations from disk")
     p_load.set_defaults(func=cmd_load_annotations)
+
+    # stats
+    p_stats = sub.add_parser("stats", help="Show token savings telemetry for this session")
+    p_stats.add_argument("--json", action="store_true", help="Output raw JSON instead of human-readable summary")
+    p_stats.set_defaults(func=cmd_stats)
 
     # ready
     p_ready = sub.add_parser("ready", help="Check if symbol extraction is complete")

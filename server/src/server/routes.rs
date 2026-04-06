@@ -41,13 +41,14 @@ fn require_project(state: &AppState, headers: &HeaderMap) -> Result<Arc<Project>
     Ok(project)
 }
 
-/// Convert a symbol lookup error into an AppError, enriching the message when
-/// indexing hasn't completed yet so the client can distinguish "symbol missing"
-/// from "symbol not yet indexed".
+/// Convert a symbol operation error into an AppError. When indexing hasn't
+/// completed and the error looks like a lookup miss ("not found"), the message
+/// is enriched so the client can distinguish "symbol missing" from "not yet
+/// indexed". Non-lookup errors (e.g., file-read failures) are passed through
+/// as-is to avoid mislabeling.
 fn symbol_not_found_or_not_ready(err: String, indexing_complete: bool) -> AppError {
-    if indexing_complete {
-        AppError::NotFound(err)
-    } else {
+    let is_lookup_miss = err.contains("not found") || err.contains("ambiguous");
+    if is_lookup_miss && !indexing_complete {
         AppError::BadRequest(format!(
             "{}. NOTE: Symbol indexing is still in progress (indexing_complete=false). \
              The symbol may not have been extracted yet. \
@@ -55,6 +56,11 @@ fn symbol_not_found_or_not_ready(err: String, indexing_complete: bool) -> AppErr
              then retry.",
             err
         ))
+    } else if is_lookup_miss {
+        AppError::NotFound(err)
+    } else {
+        // Non-lookup errors (IO, parse failures, etc.) stay as internal errors
+        AppError::Internal(err)
     }
 }
 
@@ -184,7 +190,9 @@ async fn create_session(
         let ft = project.file_tree.clone();
         let st = project.symbol_table.clone();
         let root = project.root.clone();
-        let _ = annotations::load_annotations(&root, &ft, &st);
+        if let Err(e) = annotations::load_annotations(&root, &ft, &st) {
+            tracing::warn!("Failed to reload annotations for {}: {}", root.display(), e);
+        }
     }
 
     Ok(Json(json!({

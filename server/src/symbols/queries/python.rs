@@ -9,6 +9,11 @@ pub const SYMBOLS_QUERY: &str = r#"
   body: (block
     (function_definition
       name: (identifier) @method.name) @method.def)?) @class.def
+
+(module
+  (expression_statement
+    (assignment
+      left: (identifier) @constant.name)) @constant.def)
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

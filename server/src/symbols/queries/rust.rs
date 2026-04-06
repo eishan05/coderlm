@@ -30,6 +30,9 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (mod_item
   name: (identifier) @mod.name) @mod.def
+
+(macro_definition
+  name: (identifier) @macro.name) @macro.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

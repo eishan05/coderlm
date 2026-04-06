@@ -165,6 +165,13 @@ pub fn extract_symbols_from_file(
                 "mod.def" => {
                     def_node = Some(cap.node);
                 }
+                "macro.name" => {
+                    name = Some(text.to_string());
+                    kind = Some(SymbolKind::Macro);
+                }
+                "macro.def" => {
+                    def_node = Some(cap.node);
+                }
                 _ => {}
             }
         }
@@ -1319,6 +1326,115 @@ class User:
             default_fn.decorators.contains(&"@staticmethod".to_string()),
             "Expected @staticmethod on 'default', got: {:?}",
             default_fn.decorators
+        );
+    }
+
+    // ── Rust macro_rules! tests ────────────────────────────────────────
+
+    #[test]
+    fn test_rust_macro_rules_extracted_as_macro() {
+        let source = r#"
+macro_rules! my_vec {
+    () => { Vec::new() };
+    ($($x:expr),+ $(,)?) => {
+        {
+            let mut v = Vec::new();
+            $(v.push($x);)+
+            v
+        }
+    };
+}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let macro_sym = symbols.iter().find(|s| s.name == "my_vec");
+        assert!(
+            macro_sym.is_some(),
+            "Expected to find a symbol named 'my_vec' for the macro_rules! definition"
+        );
+        let macro_sym = macro_sym.unwrap();
+        assert_eq!(
+            macro_sym.kind,
+            SymbolKind::Macro,
+            "macro_rules! definition should be mapped to SymbolKind::Macro"
+        );
+        assert!(
+            macro_sym.signature.contains("macro_rules!"),
+            "Signature should contain 'macro_rules!', got: '{}'",
+            macro_sym.signature
+        );
+    }
+
+    #[test]
+    fn test_rust_macro_alongside_functions_and_structs() {
+        let source = r#"
+macro_rules! log_debug {
+    ($($arg:tt)*) => { println!($($arg)*) };
+}
+
+struct Config {
+    name: String,
+}
+
+fn init() -> Config {
+    Config { name: String::new() }
+}
+
+macro_rules! assert_config {
+    ($c:expr) => { assert!(!$c.name.is_empty()) };
+}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+
+        let log_macro = symbols
+            .iter()
+            .find(|s| s.name == "log_debug" && s.kind == SymbolKind::Macro);
+        assert!(log_macro.is_some(), "Expected macro log_debug");
+
+        let config_struct = symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Struct);
+        assert!(config_struct.is_some(), "Expected struct Config");
+
+        let init_fn = symbols
+            .iter()
+            .find(|s| s.name == "init" && s.kind == SymbolKind::Function);
+        assert!(init_fn.is_some(), "Expected function init");
+
+        let assert_macro = symbols
+            .iter()
+            .find(|s| s.name == "assert_config" && s.kind == SymbolKind::Macro);
+        assert!(assert_macro.is_some(), "Expected macro assert_config");
+    }
+
+    #[test]
+    fn test_rust_macro_line_range_and_signature() {
+        let source = r#"
+macro_rules! create_fn {
+    ($name:ident) => {
+        fn $name() {
+            println!(stringify!($name));
+        }
+    };
+}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let macro_sym = symbols
+            .iter()
+            .find(|s| s.name == "create_fn" && s.kind == SymbolKind::Macro)
+            .expect("Expected macro create_fn");
+
+        // Line range should start at line 2 (1-indexed) where macro_rules! begins
+        assert_eq!(
+            macro_sym.line_range.0, 2,
+            "Macro should start at line 2, got {}",
+            macro_sym.line_range.0
+        );
+
+        // Line range should end at line 8 where the closing brace is
+        assert_eq!(
+            macro_sym.line_range.1, 8,
+            "Macro should end at line 8, got {}",
+            macro_sym.line_range.1
         );
     }
 }

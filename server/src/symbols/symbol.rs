@@ -14,6 +14,7 @@ pub enum SymbolKind {
     Variable,
     Type,
     Module,
+    Macro,
     Import,
     Other,
 }
@@ -32,6 +33,7 @@ impl SymbolKind {
             "variable" | "var" | "let" => Some(SymbolKind::Variable),
             "type" => Some(SymbolKind::Type),
             "module" | "mod" => Some(SymbolKind::Module),
+            "macro" | "macro_rules" => Some(SymbolKind::Macro),
             "import" | "use" => Some(SymbolKind::Import),
             _ => None,
         }

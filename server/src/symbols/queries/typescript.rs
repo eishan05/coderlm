@@ -74,6 +74,9 @@ pub fn config() -> LanguageConfig {
             TestPattern::CallExpression("it"),
             TestPattern::CallExpression("test"),
             TestPattern::CallExpression("describe"),
+            TestPattern::FileContains(".test."),
+            TestPattern::FileContains(".spec."),
+            TestPattern::FileContains("__tests__"),
         ],
     }
 }
@@ -135,6 +138,9 @@ pub fn js_config() -> LanguageConfig {
             TestPattern::CallExpression("it"),
             TestPattern::CallExpression("test"),
             TestPattern::CallExpression("describe"),
+            TestPattern::FileContains(".test."),
+            TestPattern::FileContains(".spec."),
+            TestPattern::FileContains("__tests__"),
         ],
     }
 }

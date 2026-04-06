@@ -52,6 +52,8 @@ pub fn config() -> LanguageConfig {
         test_patterns: vec![
             TestPattern::Attribute("Test"),
             TestPattern::Attribute("org.junit"),
+            TestPattern::FileContains("Test"),
+            TestPattern::FileContains("/test/"),
         ],
     }
 }

@@ -86,6 +86,10 @@ pub fn config() -> LanguageConfig {
         symbols_query: SYMBOLS_QUERY,
         callers_query: CALLERS_QUERY,
         variables_query: VARIABLES_QUERY,
-        test_patterns: vec![TestPattern::FunctionPrefix("test_")],
+        test_patterns: vec![
+            TestPattern::FunctionPrefix("test_"),
+            TestPattern::FileContains("test_"),
+            TestPattern::FileContains("_test."),
+        ],
     }
 }

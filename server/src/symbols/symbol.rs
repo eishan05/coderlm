@@ -52,4 +52,8 @@ pub struct Symbol {
     pub definition: Option<String>,
     /// Parent symbol name (e.g. struct for a method).
     pub parent: Option<String>,
+    /// Decorators attached to this symbol (e.g. `@property`, `@app.route("/path")`).
+    /// Only populated for languages that support decorators (currently Python).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorators: Vec<String>,
 }

@@ -195,17 +195,32 @@ pub fn extract_symbols_from_file(
                 }
                 (inner_node, decs)
             } else {
-                // Skip bare function_definition/class_definition nodes whose
-                // parent is a decorated_definition — those are already handled
-                // by the decorated_definition pattern and would create duplicates.
-                // Only skip for Function/Class kinds (not Method), since methods
-                // resolved from class-body queries have a block parent, not
-                // decorated_definition. The kind guard makes this intent explicit.
+                // Skip bare function_definition/class_definition nodes that
+                // are already handled by more specific query patterns:
+                // 1. Direct children of decorated_definition — those are
+                //    handled by the decorated_definition patterns.
+                // 2. Functions resolved as SymbolKind::Function that live
+                //    inside a class_definition — those are methods, handled
+                //    by the class-body method patterns.
                 if matches!(kind, SymbolKind::Function | SymbolKind::Class) {
                     if let Some(parent_node) = node.parent() {
                         if parent_node.kind() == "decorated_definition" {
                             continue;
                         }
+                    }
+                }
+                if kind == SymbolKind::Function {
+                    // Walk ancestors to check if this function is inside a class.
+                    // If so, skip — it will be emitted as a Method by the class-body pattern.
+                    let mut ancestor = node.parent();
+                    while let Some(anc) = ancestor {
+                        if anc.kind() == "class_definition" {
+                            break;
+                        }
+                        ancestor = anc.parent();
+                    }
+                    if ancestor.is_some() {
+                        continue;
                     }
                 }
                 (node, decorators)
@@ -687,6 +702,15 @@ ANOTHER_CONST = True
             .iter()
             .find(|s| s.name == "handle" && s.kind == SymbolKind::Method);
         assert!(handle_method.is_some(), "Expected method handle from class Handler");
+
+        // Methods inside classes should NOT also appear as Function symbols
+        let handle_func = symbols
+            .iter()
+            .find(|s| s.name == "handle" && s.kind == SymbolKind::Function);
+        assert!(
+            handle_func.is_none(),
+            "Class method 'handle' should NOT also appear as a Function symbol"
+        );
     }
 
     #[test]
@@ -1256,6 +1280,15 @@ class User:
         assert!(
             greet.unwrap().decorators.is_empty(),
             "Plain method 'greet' should have no decorators"
+        );
+
+        // Methods inside classes should NOT also appear as Function symbols
+        let greet_func = symbols
+            .iter()
+            .find(|s| s.name == "greet" && s.kind == SymbolKind::Function);
+        assert!(
+            greet_func.is_none(),
+            "Class method 'greet' should NOT also appear as a Function symbol"
         );
 
         // Decorated method inside decorated class

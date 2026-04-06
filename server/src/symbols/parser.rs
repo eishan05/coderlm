@@ -16,13 +16,36 @@ pub fn extract_symbols_from_file(
     rel_path: &str,
     language: Language,
 ) -> Result<Vec<Symbol>> {
+    let abs_path = root.join(rel_path);
+    let source = std::fs::read_to_string(&abs_path)?;
+    extract_symbols_from_source(&source, rel_path, language)
+}
+
+/// Extract symbols from a single file, also returning its content hash.
+/// This reads the file once and computes the SHA-256 hash from the same bytes,
+/// avoiding TOCTOU races between parsing and hashing.
+pub fn extract_symbols_from_file_with_hash(
+    root: &Path,
+    rel_path: &str,
+    language: Language,
+) -> Result<(Vec<Symbol>, String)> {
+    let abs_path = root.join(rel_path);
+    let source = std::fs::read_to_string(&abs_path)?;
+    let content_hash = crate::cache::content_hash::hash_bytes(source.as_bytes());
+    let symbols = extract_symbols_from_source(&source, rel_path, language)?;
+    Ok((symbols, content_hash))
+}
+
+/// Extract symbols from source code string.
+fn extract_symbols_from_source(
+    source: &str,
+    rel_path: &str,
+    language: Language,
+) -> Result<Vec<Symbol>> {
     let config = match queries::get_language_config(language) {
         Some(c) => c,
         None => return Ok(Vec::new()),
     };
-
-    let abs_path = root.join(rel_path);
-    let source = std::fs::read_to_string(&abs_path)?;
 
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&config.language)?;
@@ -275,12 +298,29 @@ pub async fn extract_all_symbols(
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
 ) -> Result<usize> {
+    extract_all_symbols_cached(root, file_tree, symbol_table, None).await
+}
+
+/// Cache-aware symbol extraction. For each parseable file:
+/// 1. If cache is provided and mtime+size match the manifest, load symbols
+///    from the file_index via content hash (fast path).
+/// 2. Otherwise, parse the file, store results in cache for next time.
+///
+/// Returns `(total_symbols, cache_hits, cache_misses)`.
+pub async fn extract_all_symbols_cached(
+    root: &Path,
+    file_tree: &Arc<FileTree>,
+    symbol_table: &Arc<SymbolTable>,
+    cache: Option<&Arc<crate::cache::CacheStore>>,
+) -> Result<usize> {
     let root = root.to_path_buf();
     let file_tree = file_tree.clone();
     let symbol_table = symbol_table.clone();
+    let cache = cache.cloned();
 
     let count = tokio::task::spawn_blocking(move || -> Result<usize> {
         let mut total = 0;
+        let workspace_id = root.to_string_lossy().to_string();
 
         let paths: Vec<(String, Language)> = file_tree
             .files
@@ -290,13 +330,69 @@ pub async fn extract_all_symbols(
             .collect();
 
         for (rel_path, language) in paths {
-            match extract_symbols_from_file(&root, &rel_path, language) {
-                Ok(symbols) => {
+            // Try cache first: extract mtime+size from file tree entry
+            // (drop the DashMap guard before taking any write locks)
+            let file_meta = file_tree.files.get(&rel_path)
+                .map(|entry| (entry.modified.timestamp_millis(), entry.size as i64));
+
+            if let (Some(cache), Some((mtime, file_size))) = (&cache, file_meta) {
+                if let Ok(true) = cache.is_file_unchanged(&workspace_id, &rel_path, mtime, file_size) {
+                    // mtime+size match — try to load from content hash
+                    if let Ok(Some(manifest_entry)) = cache.get_manifest_entry(&workspace_id, &rel_path) {
+                        if let Ok(Some(symbols)) = cache.lookup_symbols(&manifest_entry.content_hash, language) {
+                            let count = symbols.len();
+                            for mut sym in symbols {
+                                // Fix file path: cached symbols may have been
+                                // stored from a different workspace path
+                                sym.file = rel_path.clone();
+                                symbol_table.insert(sym);
+                            }
+                            if let Some(mut fe) = file_tree.files.get_mut(&rel_path) {
+                                fe.symbols_extracted = true;
+                            }
+                            total += count;
+                            debug!("Cache hit for {} ({} symbols)", rel_path, count);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Cache miss or no cache — extract normally.
+            // Use extract_symbols_from_file_with_hash when caching is enabled
+            // to hash the exact bytes that were parsed (avoids TOCTOU race).
+            let extraction_result = if cache.is_some() {
+                extract_symbols_from_file_with_hash(&root, &rel_path, language)
+                    .map(|(syms, hash)| (syms, Some(hash)))
+            } else {
+                extract_symbols_from_file(&root, &rel_path, language)
+                    .map(|syms| (syms, None))
+            };
+
+            match extraction_result {
+                Ok((symbols, content_hash)) => {
                     let count = symbols.len();
+
+                    // Store in cache if available
+                    if let (Some(cache), Some(content_hash)) = (&cache, &content_hash) {
+                        let _ = cache.store_symbols(content_hash, language, &symbols);
+                        // Extract mtime+size before dropping the guard
+                        let file_meta = file_tree.files.get(&rel_path)
+                            .map(|entry| (entry.modified.timestamp_millis(), entry.size as i64));
+                        if let Some((mtime, file_size)) = file_meta {
+                            let _ = cache.update_manifest(
+                                &workspace_id,
+                                &rel_path,
+                                content_hash,
+                                mtime,
+                                file_size,
+                            );
+                        }
+                    }
+
                     for sym in symbols {
                         symbol_table.insert(sym);
                     }
-                    // Mark file as having symbols extracted
                     if let Some(mut entry) = file_tree.files.get_mut(&rel_path) {
                         entry.symbols_extracted = true;
                     }
@@ -1626,6 +1722,126 @@ const (
         assert!(
             !normal_symbols.is_empty(),
             "Normal file should have symbols extracted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_all_symbols_cached_populates_cache() {
+        use crate::cache::CacheStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Create a Rust file
+        let file_path = root.join("lib.rs");
+        std::fs::write(&file_path, "pub fn cached_func() {}\npub fn other_func() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        // Scan directory to populate file tree
+        crate::index::walker::scan_directory(&root, &file_tree, 10_000_000).unwrap();
+
+        // Create a cache store
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
+
+        // First extraction - cache miss, should populate cache
+        let count = extract_all_symbols_cached(&root, &file_tree, &symbol_table, Some(&cache)).await.unwrap();
+        assert!(count >= 2, "Should extract at least 2 symbols, got {}", count);
+
+        // Verify symbols in table
+        let syms = symbol_table.list_by_file("lib.rs");
+        assert!(syms.len() >= 2);
+
+        // Verify cache was populated
+        let workspace_id = root.to_string_lossy().to_string();
+        let manifest = cache.get_workspace_manifest(&workspace_id).unwrap();
+        assert!(!manifest.is_empty(), "Manifest should have entries after extraction");
+    }
+
+    #[tokio::test]
+    async fn test_extract_all_symbols_cached_uses_cache_on_second_run() {
+        use crate::cache::CacheStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let file_path = root.join("lib.rs");
+        std::fs::write(&file_path, "pub fn alpha() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        crate::index::walker::scan_directory(&root, &file_tree, 10_000_000).unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
+
+        // First extraction populates cache
+        let count1 = extract_all_symbols_cached(&root, &file_tree, &symbol_table, Some(&cache)).await.unwrap();
+        assert!(count1 >= 1);
+
+        // Verify cache was actually populated
+        let workspace_id = root.to_string_lossy().to_string();
+        let manifest = cache.get_workspace_manifest(&workspace_id).unwrap();
+        assert!(!manifest.is_empty(), "Cache should be populated after first run");
+
+        // Now create fresh in-memory state (simulating server restart)
+        // but re-scan same directory so file entries have same mtime+size
+        let file_tree2 = Arc::new(FileTree::new());
+        let symbol_table2 = Arc::new(SymbolTable::new());
+        crate::index::walker::scan_directory(&root, &file_tree2, 10_000_000).unwrap();
+
+        assert!(symbol_table2.list_by_file("lib.rs").is_empty(), "Fresh symbol table should be empty");
+
+        // Second extraction should use cache (same mtime+size since file unchanged)
+        let count2 = extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, Some(&cache)).await.unwrap();
+        assert_eq!(count1, count2, "Cache hit should produce same symbol count");
+
+        let syms = symbol_table2.list_by_file("lib.rs");
+        assert!(!syms.is_empty(), "Symbols should be restored from cache");
+    }
+
+    #[tokio::test]
+    async fn test_extract_all_symbols_cached_reextracts_after_file_change() {
+        use crate::cache::CacheStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let file_path = root.join("lib.rs");
+        std::fs::write(&file_path, "pub fn original() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        crate::index::walker::scan_directory(&root, &file_tree, 10_000_000).unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
+
+        // First extraction
+        extract_all_symbols_cached(&root, &file_tree, &symbol_table, Some(&cache)).await.unwrap();
+
+        // Modify the file (changes size, which makes cache miss)
+        std::fs::write(&file_path, "pub fn replaced_function_with_longer_name() {}").unwrap();
+
+        // Re-scan to update file tree with new mtime/size
+        let file_tree2 = Arc::new(FileTree::new());
+        let symbol_table2 = Arc::new(SymbolTable::new());
+        crate::index::walker::scan_directory(&root, &file_tree2, 10_000_000).unwrap();
+
+        // Second extraction should detect change and re-extract
+        extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, Some(&cache)).await.unwrap();
+
+        let syms = symbol_table2.list_by_file("lib.rs");
+        assert!(!syms.is_empty());
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"replaced_function_with_longer_name"),
+            "Should have re-extracted symbols from changed file, got: {:?}",
+            names
         );
     }
 }

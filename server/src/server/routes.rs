@@ -69,6 +69,7 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/structure/redefine", post(redefine_file))
         .route("/api/v1/structure/mark", post(mark_file))
         // Symbols
+        .route("/api/v1/symbols/ready", get(symbols_ready))
         .route("/api/v1/symbols", get(list_symbols))
         .route("/api/v1/symbols/search", get(search_symbols))
         .route("/api/v1/symbols/define", post(define_symbol))
@@ -128,6 +129,7 @@ async fn list_roots(State(state): State<AppState>) -> Json<Value> {
                 "symbol_count": project.symbol_table.len(),
                 "last_active": (*project.last_active.lock()).to_rfc3339(),
                 "session_count": session_count,
+                "indexing_complete": project.is_indexing_complete(),
             })
         })
         .collect();
@@ -158,20 +160,14 @@ async fn create_session(
     let created_at = session.created_at;
     state.inner.sessions.insert(id.clone(), session);
 
-    // Load annotations from disk after project is indexed
-    let ft = project.file_tree.clone();
-    let st = project.symbol_table.clone();
-    let root = project.root.clone();
-    tokio::spawn(async move {
-        // Small delay to let symbol extraction start first
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = annotations::load_annotations(&root, &ft, &st);
-    });
+    // Annotations are now loaded automatically after symbol extraction
+    // completes (see state.rs), so no racy spawn is needed here.
 
     Ok(Json(json!({
         "session_id": id,
         "created_at": created_at.to_rfc3339(),
         "project": project.root.display().to_string(),
+        "indexing_complete": project.is_indexing_complete(),
     })))
 }
 
@@ -190,12 +186,21 @@ async fn get_session(
         .get(&params.id)
         .ok_or_else(|| AppError::NotFound(format!("Session '{}' not found", params.id)))?;
 
+    // Check indexing status for this session's project
+    let indexing_complete = state
+        .inner
+        .projects
+        .get(&session.project_path)
+        .map(|p| p.is_indexing_complete())
+        .unwrap_or(false);
+
     Ok(Json(json!({
         "session_id": session.id,
         "project": session.project_path.display().to_string(),
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
         "history_count": session.history.len(),
+        "indexing_complete": indexing_complete,
     })))
 }
 
@@ -313,6 +318,37 @@ async fn mark_file(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+struct SymbolsReadyQuery {
+    /// If true, block until indexing completes instead of returning immediately.
+    wait: Option<bool>,
+}
+
+/// Check (or wait for) symbol extraction readiness.
+///
+/// `GET /api/v1/symbols/ready` — returns `{"ready": bool, "symbol_count": N}`
+/// `GET /api/v1/symbols/ready?wait=true` — blocks until extraction completes
+async fn symbols_ready(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SymbolsReadyQuery>,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+
+    if params.wait.unwrap_or(false) {
+        project.wait_until_indexed().await;
+    }
+
+    let ready = project.is_indexing_complete();
+    let symbol_count = project.symbol_table.len();
+    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/ready",
+        &format!("ready={}, {} symbols", ready, symbol_count));
+    Ok(Json(json!({
+        "ready": ready,
+        "symbol_count": symbol_count,
+    })))
+}
+
+#[derive(Deserialize)]
 struct SymbolListQuery {
     kind: Option<String>,
     file: Option<String>,
@@ -325,6 +361,7 @@ async fn list_symbols(
     Query(params): Query<SymbolListQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
     let kind_filter = params.kind.as_deref().and_then(SymbolKind::from_str);
     let limit = params.limit.unwrap_or(100);
     let results = symbol_ops::list_symbols(
@@ -335,7 +372,7 @@ async fn list_symbols(
     );
     let preview = format!("{} symbols", results.len());
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols", &preview);
-    Ok(Json(json!({ "symbols": results, "count": results.len() })))
+    Ok(Json(json!({ "symbols": results, "count": results.len(), "indexing_complete": indexing_complete })))
 }
 
 #[derive(Deserialize)]
@@ -350,11 +387,12 @@ async fn search_symbols(
     Query(params): Query<SymbolSearchQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
     let limit = params.limit.unwrap_or(20);
     let results = symbol_ops::search_symbols(&project.symbol_table, &params.q, limit);
     let preview = format!("{} matches for '{}'", results.len(), params.q);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/search", &preview);
-    Ok(Json(json!({ "symbols": results, "count": results.len() })))
+    Ok(Json(json!({ "symbols": results, "count": results.len(), "indexing_complete": indexing_complete })))
 }
 
 #[derive(Deserialize)]
@@ -416,6 +454,7 @@ async fn get_implementation(
     Query(params): Query<ImplementationQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
     let source = symbol_ops::get_implementation(
         &project.root,
         &project.symbol_table,
@@ -430,6 +469,7 @@ async fn get_implementation(
         "symbol": params.symbol,
         "file": params.file,
         "source": source,
+        "indexing_complete": indexing_complete,
     })))
 }
 
@@ -448,6 +488,7 @@ async fn find_tests(
     Query(params): Query<TestsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
     let limit = params.limit.unwrap_or(20);
     let tests = symbol_ops::find_tests(
         &project.root,
@@ -461,7 +502,7 @@ async fn find_tests(
     .map_err(AppError::NotFound)?;
     let preview = format!("{} tests for {}", tests.len(), params.symbol);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/tests", &preview);
-    Ok(Json(json!({ "tests": tests, "count": tests.len() })))
+    Ok(Json(json!({ "tests": tests, "count": tests.len(), "indexing_complete": indexing_complete })))
 }
 
 #[derive(Deserialize)]
@@ -479,6 +520,7 @@ async fn find_callers(
     Query(params): Query<CallersQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
     let limit = params.limit.unwrap_or(50);
     let callers = symbol_ops::find_callers(
         &project.root,
@@ -492,7 +534,7 @@ async fn find_callers(
     .map_err(AppError::NotFound)?;
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/callers", &preview);
-    Ok(Json(json!({ "callers": callers, "count": callers.len() })))
+    Ok(Json(json!({ "callers": callers, "count": callers.len(), "indexing_complete": indexing_complete })))
 }
 
 #[derive(Deserialize)]
@@ -509,6 +551,7 @@ async fn list_variables(
     Query(params): Query<VariablesQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
     let vars = symbol_ops::list_variables(
         &project.root,
         &project.symbol_table,
@@ -519,7 +562,7 @@ async fn list_variables(
     .map_err(AppError::NotFound)?;
     let preview = format!("{} variables in {}", vars.len(), params.function);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/variables", &preview);
-    Ok(Json(json!({ "variables": vars, "count": vars.len() })))
+    Ok(Json(json!({ "variables": vars, "count": vars.len(), "indexing_complete": indexing_complete })))
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +718,15 @@ async fn load_annotations(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
+    if !indexing_complete {
+        return Err(AppError::BadRequest(
+            "Symbol extraction is still in progress. Wait for indexing to complete \
+             before loading annotations, or call GET /api/v1/symbols/ready?wait=true first. \
+             Loading annotations before symbols are ready will silently drop symbol annotations."
+                .into(),
+        ));
+    }
     let data = annotations::load_annotations(
         &project.root,
         &project.file_tree,

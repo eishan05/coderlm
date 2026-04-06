@@ -25,6 +25,7 @@ Usage:
   python3 coderlm_cli.py load-annotations
   python3 coderlm_cli.py history [--limit N]
   python3 coderlm_cli.py status
+  python3 coderlm_cli.py ready [--wait]
   python3 coderlm_cli.py cleanup
 """
 
@@ -170,6 +171,23 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"Server: {health.get('status', 'ok')} "
           f"({health.get('projects', 0)} projects, "
           f"{health.get('active_sessions', 0)} sessions)")
+
+    # Wait for symbol extraction to complete so subsequent commands see all symbols.
+    # Uses the blocking /symbols/ready?wait=true endpoint.
+    if not result.get("indexing_complete", False):
+        print("Waiting for symbol extraction to complete...", end="", flush=True)
+        try:
+            ready_result = _request(
+                "GET",
+                f"{base}/symbols/ready?wait=true",
+                headers={"X-Session-Id": result["session_id"]},
+                timeout=300,  # 5 minute timeout for large projects
+            )
+            print(f" done ({ready_result.get('symbol_count', 0)} symbols)")
+        except SystemExit:
+            print(" (timed out or failed, symbols may be incomplete)")
+    else:
+        print("Indexing already complete.")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -364,6 +382,15 @@ def cmd_load_annotations(args: argparse.Namespace) -> None:
     _output(_post(state, "/annotations/load", {}))
 
 
+def cmd_ready(args: argparse.Namespace) -> None:
+    """Check or wait for symbol extraction readiness."""
+    state = _load_state()
+    params = {}
+    if args.wait:
+        params["wait"] = "true"
+    _output(_get(state, "/symbols/ready", params))
+
+
 def cmd_cleanup(args: argparse.Namespace) -> None:
     state = _load_state()
     if not state.get("session_id"):
@@ -519,6 +546,11 @@ def build_parser() -> argparse.ArgumentParser:
     # load-annotations
     p_load = sub.add_parser("load-annotations", help="Load annotations from disk")
     p_load.set_defaults(func=cmd_load_annotations)
+
+    # ready
+    p_ready = sub.add_parser("ready", help="Check if symbol extraction is complete")
+    p_ready.add_argument("--wait", action="store_true", help="Block until indexing completes")
+    p_ready.set_defaults(func=cmd_ready)
 
     # cleanup
     p_clean = sub.add_parser("cleanup", help="Delete the current session")

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use ignore::gitignore::Gitignore;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,13 +44,18 @@ pub fn start_watcher(
     let root_buf = root.to_path_buf();
     let root_for_handler = root_buf.clone();
 
+    // Load .coderlmignore patterns (if present) so the watcher can skip
+    // files that are excluded by project-specific ignore rules.
+    let coderlm_ignore = Arc::new(config::load_coderlm_ignore(root));
+    let ignore_for_handler = coderlm_ignore.clone();
+
     // Channel to decouple the watcher callback from async processing.
     // The bounded channel provides backpressure if the processor falls behind.
     let (tx, rx) = mpsc::channel::<Vec<WatcherEvent>>(64);
 
     // Spawn the async processor that drains the channel and handles events.
     let rt = tokio::runtime::Handle::current();
-    rt.spawn(process_events(rx, file_tree.clone(), symbol_table.clone(), max_file_size));
+    rt.spawn(process_events(rx, file_tree.clone(), symbol_table.clone(), max_file_size, coderlm_ignore));
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(500),
@@ -59,6 +65,7 @@ pub fn start_watcher(
                     let watcher_events = collect_events(
                         &root_for_handler,
                         max_file_size,
+                        &ignore_for_handler,
                         events,
                     );
                     if !watcher_events.is_empty() {
@@ -97,6 +104,7 @@ pub struct WatcherHandle {
 fn collect_events(
     root: &Path,
     _max_file_size: u64,
+    coderlm_ignore: &Gitignore,
     events: Vec<notify_debouncer_mini::DebouncedEvent>,
 ) -> Vec<WatcherEvent> {
     let mut watcher_events = Vec::new();
@@ -110,8 +118,16 @@ fn collect_events(
             Err(_) => continue,
         };
 
-        // Skip ignored paths
+        // Skip ignored paths (hardcoded patterns)
         if should_skip(&rel_path) {
+            continue;
+        }
+
+        // Skip paths matched by .coderlmignore
+        if coderlm_ignore
+            .matched_path_or_any_parents(&rel_path, path.is_dir())
+            .is_ignore()
+        {
             continue;
         }
 
@@ -145,6 +161,7 @@ async fn process_events(
     file_tree: Arc<FileTree>,
     symbol_table: Arc<SymbolTable>,
     max_file_size: u64,
+    coderlm_ignore: Arc<Gitignore>,
 ) {
     while let Some(events) = rx.recv().await {
         for event in events {
@@ -155,6 +172,7 @@ async fn process_events(
                         &file_tree,
                         &symbol_table,
                         max_file_size,
+                        &coderlm_ignore,
                         &rel_path,
                         &abs_path,
                     ).await;
@@ -175,11 +193,20 @@ async fn handle_file_change(
     file_tree: &Arc<FileTree>,
     symbol_table: &Arc<SymbolTable>,
     max_file_size: u64,
+    coderlm_ignore: &Gitignore,
     rel_path: &str,
     abs_path: &Path,
 ) {
     // Check extension-based ignoring
     if config::should_ignore_extension(rel_path) {
+        return;
+    }
+
+    // Check .coderlmignore patterns
+    if coderlm_ignore
+        .matched_path_or_any_parents(rel_path, false)
+        .is_ignore()
+    {
         return;
     }
 
@@ -284,6 +311,11 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
+    /// Return an empty Gitignore matcher for tests that don't need custom ignore rules.
+    fn empty_ignore() -> Gitignore {
+        Gitignore::empty()
+    }
+
     // ---- Tests for collect_events ----
 
     #[test]
@@ -297,7 +329,7 @@ mod tests {
             kind: DebouncedEventKind::Any,
         }];
 
-        let result = collect_events(&root, 1024 * 1024, events);
+        let result = collect_events(&root, 1024 * 1024, &empty_ignore(), events);
         assert_eq!(result.len(), 1);
         match &result[0] {
             WatcherEvent::Changed { rel_path, .. } => {
@@ -317,7 +349,7 @@ mod tests {
             kind: DebouncedEventKind::Any,
         }];
 
-        let result = collect_events(&root, 1024 * 1024, events);
+        let result = collect_events(&root, 1024 * 1024, &empty_ignore(), events);
         assert_eq!(result.len(), 1);
         match &result[0] {
             WatcherEvent::Deleted { rel_path } => {
@@ -338,7 +370,7 @@ mod tests {
             kind: DebouncedEventKind::Any,
         }];
 
-        let result = collect_events(&root, 1024 * 1024, events);
+        let result = collect_events(&root, 1024 * 1024, &empty_ignore(), events);
         assert!(result.is_empty(), "Events in ignored dirs should be skipped");
     }
 
@@ -353,7 +385,7 @@ mod tests {
             kind: DebouncedEventKind::AnyContinuous,
         }];
 
-        let result = collect_events(&root, 1024 * 1024, events);
+        let result = collect_events(&root, 1024 * 1024, &empty_ignore(), events);
         assert!(result.is_empty(), "AnyContinuous events should be ignored");
     }
 
@@ -366,7 +398,7 @@ mod tests {
             kind: DebouncedEventKind::Any,
         }];
 
-        let result = collect_events(&root, 1024 * 1024, events);
+        let result = collect_events(&root, 1024 * 1024, &empty_ignore(), events);
         assert!(result.is_empty());
     }
 
@@ -385,6 +417,7 @@ mod tests {
             &file_tree,
             &symbol_table,
             1024 * 1024,
+            &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
         ).await;
@@ -408,6 +441,7 @@ mod tests {
             &file_tree,
             &symbol_table,
             1024 * 1024,
+            &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
         ).await;
@@ -434,6 +468,7 @@ mod tests {
             &file_tree,
             &symbol_table,
             1, // 1 byte max
+            &empty_ignore(),
             "big.rs",
             &root.join("big.rs"),
         ).await;
@@ -458,6 +493,7 @@ mod tests {
             &file_tree,
             &symbol_table,
             1024 * 1024,
+            &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
         ).await;
@@ -475,6 +511,7 @@ mod tests {
             &file_tree,
             &symbol_table,
             1024 * 1024,
+            &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
         ).await;
@@ -546,7 +583,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         let ft = file_tree.clone();
         let st = symbol_table.clone();
-        let handle = tokio::spawn(process_events(rx, ft, st, 1024 * 1024));
+        let handle = tokio::spawn(process_events(rx, ft, st, 1024 * 1024, Arc::new(empty_ignore())));
 
         // Send a batch with one Changed and one Deleted event
         tx.send(vec![
@@ -618,6 +655,7 @@ mod tests {
             &file_tree,
             &symbol_table,
             1024 * 1024,
+            &empty_ignore(),
             "image.png",
             &abs,
         ).await;
@@ -625,5 +663,156 @@ mod tests {
         // Should not be added to the file tree since it's extension-ignored
         assert!(file_tree.get("image.png").is_none(),
             "Extension-ignored files should not be added to file tree");
+    }
+
+    // ---- Tests for .coderlmignore support ----
+
+    /// Helper: create a `.coderlmignore` file in the project root and return
+    /// the loaded Gitignore matcher.
+    fn create_coderlmignore(root: &Path, content: &str) -> Gitignore {
+        let ignore_path = root.join(config::CODERLM_IGNORE_FILENAME);
+        std::fs::write(&ignore_path, content).unwrap();
+        config::load_coderlm_ignore(root)
+    }
+
+    #[test]
+    fn test_collect_events_skips_coderlmignored_file() {
+        let (_dir, root) = setup_test_dir();
+        let gi = create_coderlmignore(&root, "generated/\n");
+        create_rust_file(&root, "generated/proto.rs", "// generated code");
+
+        let abs_path = root.join("generated/proto.rs");
+        let events = vec![notify_debouncer_mini::DebouncedEvent {
+            path: abs_path,
+            kind: DebouncedEventKind::Any,
+        }];
+
+        let result = collect_events(&root, 1024 * 1024, &gi, events);
+        assert!(result.is_empty(), "Files matching .coderlmignore should be skipped");
+    }
+
+    #[test]
+    fn test_collect_events_allows_non_coderlmignored_file() {
+        let (_dir, root) = setup_test_dir();
+        let gi = create_coderlmignore(&root, "generated/\n");
+        create_rust_file(&root, "src/main.rs", "fn main() {}");
+
+        let abs_path = root.join("src/main.rs");
+        let events = vec![notify_debouncer_mini::DebouncedEvent {
+            path: abs_path,
+            kind: DebouncedEventKind::Any,
+        }];
+
+        let result = collect_events(&root, 1024 * 1024, &gi, events);
+        assert_eq!(result.len(), 1, "Non-ignored files should pass through");
+    }
+
+    #[test]
+    fn test_collect_events_coderlmignore_glob_pattern() {
+        let (_dir, root) = setup_test_dir();
+        let gi = create_coderlmignore(&root, "*.pb.go\n");
+        create_rust_file(&root, "api/service.pb.go", "package api");
+
+        let abs_path = root.join("api/service.pb.go");
+        let events = vec![notify_debouncer_mini::DebouncedEvent {
+            path: abs_path,
+            kind: DebouncedEventKind::Any,
+        }];
+
+        let result = collect_events(&root, 1024 * 1024, &gi, events);
+        assert!(result.is_empty(), "Glob patterns in .coderlmignore should work");
+    }
+
+    #[test]
+    fn test_collect_events_coderlmignore_negation() {
+        let (_dir, root) = setup_test_dir();
+        // Ignore all .snap files except important.snap
+        let gi = create_coderlmignore(&root, "*.snap\n!important.snap\n");
+        create_rust_file(&root, "important.snap", "keep this");
+        create_rust_file(&root, "junk.snap", "discard this");
+
+        let events = vec![
+            notify_debouncer_mini::DebouncedEvent {
+                path: root.join("important.snap"),
+                kind: DebouncedEventKind::Any,
+            },
+            notify_debouncer_mini::DebouncedEvent {
+                path: root.join("junk.snap"),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+
+        let result = collect_events(&root, 1024 * 1024, &gi, events);
+        // important.snap should be whitelisted, junk.snap should be ignored
+        assert_eq!(result.len(), 1, "Negation patterns should whitelist files");
+        match &result[0] {
+            WatcherEvent::Changed { rel_path, .. } => {
+                assert_eq!(rel_path, "important.snap");
+            }
+            _ => panic!("Expected Changed event for important.snap"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_change_skips_coderlmignored_file() {
+        let (_dir, root) = setup_test_dir();
+        let gi = create_coderlmignore(&root, "generated/\n");
+        create_rust_file(&root, "generated/proto.rs", "pub fn generated() {}");
+
+        let file_tree = Arc::new(FileTree::new());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        handle_file_change(
+            &root,
+            &file_tree,
+            &symbol_table,
+            1024 * 1024,
+            &gi,
+            "generated/proto.rs",
+            &root.join("generated/proto.rs"),
+        ).await;
+
+        assert!(file_tree.get("generated/proto.rs").is_none(),
+            "Files matching .coderlmignore should not be added to file tree");
+        assert_eq!(symbol_table.list_by_file("generated/proto.rs").len(), 0,
+            "Symbols should not be extracted for .coderlmignore'd files");
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_change_allows_non_coderlmignored_file() {
+        let (_dir, root) = setup_test_dir();
+        let gi = create_coderlmignore(&root, "generated/\n");
+        create_rust_file(&root, "src/lib.rs", "pub fn real() {}");
+
+        let file_tree = Arc::new(FileTree::new());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        handle_file_change(
+            &root,
+            &file_tree,
+            &symbol_table,
+            1024 * 1024,
+            &gi,
+            "src/lib.rs",
+            &root.join("src/lib.rs"),
+        ).await;
+
+        assert!(file_tree.get("src/lib.rs").is_some(),
+            "Non-ignored files should still be indexed");
+    }
+
+    #[test]
+    fn test_load_coderlm_ignore_missing_file_returns_empty() {
+        let (_dir, root) = setup_test_dir();
+        // No .coderlmignore file created
+        let gi = config::load_coderlm_ignore(&root);
+        assert!(gi.is_empty(), "Missing .coderlmignore should produce empty matcher");
+    }
+
+    #[test]
+    fn test_load_coderlm_ignore_with_file() {
+        let (_dir, root) = setup_test_dir();
+        let gi = create_coderlmignore(&root, "vendor/\n*.pb.go\n");
+        assert!(!gi.is_empty(), "Non-empty .coderlmignore should produce non-empty matcher");
     }
 }

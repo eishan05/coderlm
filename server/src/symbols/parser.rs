@@ -72,13 +72,16 @@ fn extract_doc_comment(
 
 /// Collect consecutive comment nodes immediately preceding a tree-sitter node.
 ///
-/// Walks backward through previous siblings, skipping blank lines and attribute
-/// nodes (e.g. Rust `#[...]`), collecting comment nodes. Only collects comments
-/// that are "doc-style" for the given language:
-/// - Rust: `///`, `//!`, `/** */`
-/// - Java/Scala: `/** */`
-/// - TypeScript/JavaScript: `/** */`
-/// - Go: `//` directly preceding (Go convention)
+/// Walks backward through previous siblings, collecting comment nodes that are
+/// adjacent (no blank line gap) and "doc-style" for the given language:
+/// - Rust: `///` outer doc comments, `/** */` outer block docs
+///   (NOT `//!` or `/*!` which are inner docs for the enclosing item)
+/// - Java/Scala: `/** */` (Javadoc/Scaladoc)
+/// - TypeScript/JavaScript: `/** */` (JSDoc)
+/// - Go: `//` directly preceding (excluding `//go:` directives)
+///
+/// Attributes (Rust `#[...]`, Java `@annotations`) are skipped over
+/// without breaking the adjacency chain.
 fn collect_preceding_comments(
     node: tree_sitter::Node,
     language: Language,
@@ -86,25 +89,52 @@ fn collect_preceding_comments(
 ) -> Vec<String> {
     let mut comments = Vec::new();
     let mut current = node;
+    // Track the start row of the current node (or the last thing we accepted)
+    // to enforce adjacency: no blank lines between comment and symbol.
+    let mut next_row = node.start_position().row;
 
     // Walk backwards through previous siblings
     while let Some(prev) = current.prev_sibling() {
         let kind = prev.kind();
         let text = prev.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
 
+        // Compute the effective "last content row" of the previous node.
+        // tree-sitter's end_position points past the last byte; when
+        // a node ends with a newline, end_position is (next_row, col 0),
+        // so we normalize to the actual last row that contains content.
+        let end_pos = prev.end_position();
+        let prev_last_row = if end_pos.column == 0 && end_pos.row > prev.start_position().row {
+            end_pos.row - 1
+        } else {
+            end_pos.row
+        };
+
+        // Adjacency check: if there is a blank line gap (more than 1 row
+        // between the last content row of prev and the start of the next
+        // accepted node), stop collecting. Attribute nodes update
+        // `next_row` when skipped.
+        if next_row > prev_last_row + 1 {
+            break;
+        }
+
         match kind {
-            // Rust line comments
+            // Rust line comments — only outer doc comments (///)
+            // Inner doc comments (//!) apply to the enclosing module, not
+            // the following item.
             "line_comment" if language == Language::Rust => {
-                if text.starts_with("///") || text.starts_with("//!") {
+                if text.starts_with("///") {
                     comments.push(text);
+                    next_row = prev.start_position().row;
                 } else {
                     break;
                 }
             }
-            // Rust block comments
+            // Rust block comments — only outer doc comments (/** */)
+            // Inner doc comments (/*! */) apply to the enclosing module.
             "block_comment" if language == Language::Rust => {
-                if text.starts_with("/**") || text.starts_with("/*!") {
+                if text.starts_with("/**") {
                     comments.push(text);
+                    next_row = prev.start_position().row;
                 } else {
                     break;
                 }
@@ -115,6 +145,7 @@ fn collect_preceding_comments(
             {
                 if text.starts_with("/**") {
                     comments.push(text);
+                    next_row = prev.start_position().row;
                 } else {
                     break;
                 }
@@ -131,20 +162,29 @@ fn collect_preceding_comments(
             {
                 if text.starts_with("/**") {
                     comments.push(text);
+                    next_row = prev.start_position().row;
                 } else {
                     break;
                 }
             }
             // Go line comments (// directly preceding is idiomatic Go doc)
+            // Exclude compiler directives like //go:noinline, //go:generate, //line
             "comment" if language == Language::Go => {
                 if text.starts_with("//") {
+                    let after_slashes = text[2..].trim_start();
+                    if after_slashes.starts_with("go:") || after_slashes.starts_with("line ") {
+                        // Compiler directive — stop collecting
+                        break;
+                    }
                     comments.push(text);
+                    next_row = prev.start_position().row;
                 } else {
                     break;
                 }
             }
             // Skip attribute nodes (e.g. Rust #[...], Java @annotations)
             "attribute_item" | "attribute" | "marker_annotation" | "annotation" => {
+                next_row = prev.start_position().row;
                 current = prev;
                 continue;
             }
@@ -169,7 +209,8 @@ fn collect_preceding_comments(
 ///
 /// Python docstrings are the first `expression_statement` in the body of a
 /// `function_definition` or `class_definition`, where the expression is a
-/// `string` node whose text starts with `"""` or `'''`.
+/// `string` node. We accept any triple-quoted string (including prefixed
+/// variants like `r"""..."""`, `u'''...'''`, etc.) per PEP 257.
 fn extract_python_docstring(
     identity_node: tree_sitter::Node,
     source: &str,
@@ -188,7 +229,7 @@ fn extract_python_docstring(
                 if expr_child.kind() == "string" || expr_child.kind() == "concatenated_string" {
                     let text = expr_child.utf8_text(source.as_bytes()).unwrap_or("");
                     let trimmed = text.trim();
-                    if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                    if is_triple_quoted_string(trimmed) {
                         return Some(trimmed.to_string());
                     }
                 }
@@ -196,9 +237,7 @@ fn extract_python_docstring(
             // The first expression_statement was not a docstring; stop looking
             break;
         }
-        // Skip `pass` or other non-expression statements, but only if
-        // we haven't found the first expression_statement yet.
-        // Actually, a docstring must be the *first statement* in the body.
+        // A docstring must be the *first statement* in the body.
         // In tree-sitter, comments/whitespace are not statement nodes,
         // so the first non-comment child should be the docstring if present.
         if child.kind() != "comment" {
@@ -207,6 +246,14 @@ fn extract_python_docstring(
     }
 
     None
+}
+
+/// Check if a string literal text is triple-quoted, possibly with a prefix
+/// like `r`, `u`, `b`, `f`, `rb`, `br`, `rf`, `fr`, etc.
+fn is_triple_quoted_string(text: &str) -> bool {
+    // Strip optional string prefix characters (case-insensitive)
+    let stripped = text.trim_start_matches(|c: char| "rubfRUBF".contains(c));
+    stripped.starts_with("\"\"\"") || stripped.starts_with("'''")
 }
 
 /// Extract symbols from source code string.
@@ -2467,6 +2514,156 @@ def api_handler():
         assert!(
             sym.doc_comment.as_ref().unwrap().contains("Handle API requests"),
             "Docstring should contain 'Handle API requests'"
+        );
+    }
+
+    // ── Codex review regression tests ─────────────────────────────────
+
+    #[test]
+    fn test_rust_inner_doc_comment_not_attached_to_following_symbol() {
+        // //! is an inner doc comment for the enclosing module/crate,
+        // NOT for the following item. It should NOT be captured.
+        let source = r#"
+//! This is module-level documentation.
+//! It describes the module.
+
+fn module_function() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "module_function").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Rust //! inner doc comments should NOT be attached to the following symbol"
+        );
+    }
+
+    #[test]
+    fn test_rust_inner_block_doc_comment_not_attached() {
+        let source = r#"
+/*! Inner block doc comment for the module. */
+
+fn after_inner_block() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "after_inner_block").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Rust /*! */ inner doc comments should NOT be attached to the following symbol"
+        );
+    }
+
+    #[test]
+    fn test_python_raw_docstring() {
+        // Raw docstrings like r"""...""" should be captured
+        let source = "def raw_doc():\n    r\"\"\"Raw docstring with \\n literal.\"\"\"\n    pass\n";
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "raw_doc").unwrap();
+        assert!(
+            sym.doc_comment.is_some(),
+            "Expected doc_comment for raw docstring r\"\"\"...\"\"\""
+        );
+        assert!(
+            sym.doc_comment.as_ref().unwrap().contains("Raw docstring"),
+            "Should capture raw docstring text"
+        );
+    }
+
+    #[test]
+    fn test_go_directive_not_captured_as_doc_comment() {
+        // Go compiler directives like //go:noinline should NOT be captured
+        let source = r#"
+package main
+
+//go:noinline
+func NoInline() {}
+
+//go:generate mockgen -source=foo.go
+func Generated() {}
+"#;
+        let symbols = extract_from_source(source, Language::Go);
+
+        let no_inline = symbols.iter().find(|s| s.name == "NoInline").unwrap();
+        assert!(
+            no_inline.doc_comment.is_none(),
+            "Go //go:noinline directive should NOT be captured as doc comment"
+        );
+
+        let generated = symbols.iter().find(|s| s.name == "Generated").unwrap();
+        assert!(
+            generated.doc_comment.is_none(),
+            "Go //go:generate directive should NOT be captured as doc comment"
+        );
+    }
+
+    #[test]
+    fn test_go_doc_comment_above_directive_not_captured() {
+        // If a directive separates a comment from the function, the comment
+        // should not be captured (directive breaks the chain)
+        let source = r#"
+package main
+
+// This is documentation for Important.
+//go:noinline
+func Important() {}
+"#;
+        let symbols = extract_from_source(source, Language::Go);
+        let sym = symbols.iter().find(|s| s.name == "Important").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Go doc comment above a directive should not be captured \
+             (directive breaks the adjacency chain)"
+        );
+    }
+
+    #[test]
+    fn test_blank_line_breaks_doc_comment_attachment_rust() {
+        // A blank line between the doc comment and the symbol means the
+        // comment is not attached to the symbol.
+        let source = r#"
+/// This comment is NOT for the function below.
+
+fn orphaned_comment() {}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        let sym = symbols.iter().find(|s| s.name == "orphaned_comment").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Doc comment separated by a blank line should NOT be attached to the symbol"
+        );
+    }
+
+    #[test]
+    fn test_blank_line_breaks_doc_comment_attachment_go() {
+        let source = r#"
+package main
+
+// This comment is far from the function.
+
+func FarAway() {}
+"#;
+        let symbols = extract_from_source(source, Language::Go);
+        let sym = symbols.iter().find(|s| s.name == "FarAway").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "Go doc comment separated by a blank line should NOT be attached"
+        );
+    }
+
+    #[test]
+    fn test_blank_line_breaks_doc_comment_attachment_java() {
+        let source = r#"
+/**
+ * This comment is NOT for the class below.
+ */
+
+public class Disconnected {
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+        let cls = symbols.iter().find(|s| s.name == "Disconnected").unwrap();
+        assert!(
+            cls.doc_comment.is_none(),
+            "Javadoc separated by a blank line should NOT be attached to the class"
         );
     }
 }

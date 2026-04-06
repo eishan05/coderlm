@@ -285,7 +285,7 @@ pub async fn extract_all_symbols(
         let paths: Vec<(String, Language)> = file_tree
             .files
             .iter()
-            .filter(|e| e.value().language.has_tree_sitter_support())
+            .filter(|e| e.value().language.has_tree_sitter_support() && !e.value().oversized)
             .map(|e| (e.key().clone(), e.value().language))
             .collect();
 
@@ -1575,6 +1575,57 @@ const (
             SymbolKind::Constant,
             "Go const block declaration should be mapped to SymbolKind::Constant, got {:?}",
             debug_sym.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_all_symbols_skips_oversized_files() {
+        use crate::index::file_entry::FileEntry;
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a normal Rust file
+        let normal_path = dir.path().join("normal.rs");
+        std::fs::write(&normal_path, "fn hello() {}\nfn world() {}").unwrap();
+
+        // Create another Rust file that we'll mark as oversized
+        let oversized_path = dir.path().join("oversized.rs");
+        std::fs::write(&oversized_path, "fn secret() {}").unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+
+        // Insert normal file
+        let mut normal_entry = FileEntry::new("normal.rs".to_string(), 27, Utc::now());
+        normal_entry.oversized = false;
+        file_tree.insert(normal_entry);
+
+        // Insert oversized file (flagged as oversized)
+        let mut oversized_entry = FileEntry::new("oversized.rs".to_string(), 15, Utc::now());
+        oversized_entry.oversized = true;
+        file_tree.insert(oversized_entry);
+
+        let symbol_table = Arc::new(SymbolTable::new());
+        let count = extract_all_symbols(dir.path(), &file_tree, &symbol_table)
+            .await
+            .unwrap();
+
+        // Should have extracted symbols only from normal.rs (hello, world)
+        assert!(count >= 2, "Expected at least 2 symbols from normal.rs, got {}", count);
+
+        // Symbols from oversized.rs should not exist
+        let oversized_symbols = symbol_table.list_by_file("oversized.rs");
+        assert!(
+            oversized_symbols.is_empty(),
+            "Oversized file should not have symbols extracted, but found: {:?}",
+            oversized_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        // Symbols from normal.rs should exist
+        let normal_symbols = symbol_table.list_by_file("normal.rs");
+        assert!(
+            !normal_symbols.is_empty(),
+            "Normal file should have symbols extracted"
         );
     }
 }

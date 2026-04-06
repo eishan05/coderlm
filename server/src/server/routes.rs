@@ -139,6 +139,7 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/symbols/callers", get(find_callers))
         .route("/api/v1/symbols/callers/batch", post(batch_callers))
         .route("/api/v1/symbols/variables", get(list_variables))
+        .route("/api/v1/symbols/outline", get(symbols_outline))
         // Content
         .route("/api/v1/peek", get(peek))
         .route("/api/v1/grep", get(grep_handler))
@@ -865,6 +866,42 @@ async fn list_variables(
     record_history(&state, sid.as_deref(), "GET", "/symbols/variables", &preview);
     record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({ "variables": vars, "count": vars.len(), "indexing_complete": indexing_complete })))
+}
+
+// ---------------------------------------------------------------------------
+// Outline (structural file summary)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct OutlineQuery {
+    file: String,
+}
+
+async fn symbols_outline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<OutlineQuery>,
+) -> Result<Json<Value>, AppError> {
+    let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
+    let outline = symbol_ops::generate_outline(
+        &project.root,
+        &project.file_tree,
+        &project.symbol_table,
+        &params.file,
+    )
+    .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
+    let sid = session_id(&headers);
+    let preview = format!("outline for {} ({} groups)", params.file, outline.groups.len());
+    record_history(&state, sid.as_deref(), "GET", "/symbols/outline", &preview);
+    record_symbol_lookup(&state, sid.as_deref());
+    Ok(Json(json!({
+        "file": outline.file,
+        "language": outline.language,
+        "line_count": outline.line_count,
+        "groups": outline.groups,
+        "indexing_complete": indexing_complete,
+    })))
 }
 
 // ---------------------------------------------------------------------------

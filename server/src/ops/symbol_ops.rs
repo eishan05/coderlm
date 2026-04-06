@@ -617,6 +617,143 @@ pub struct VariableInfo {
     pub function: String,
 }
 
+// ---------------------------------------------------------------------------
+// File outline (structural summary)
+// ---------------------------------------------------------------------------
+
+/// A structured outline of a single file, grouping symbols by kind.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileOutline {
+    /// Relative path of the file.
+    pub file: String,
+    /// Detected language.
+    pub language: Language,
+    /// Total number of lines in the file.
+    pub line_count: usize,
+    /// Symbol groups, keyed by a human-readable kind label (e.g. "Functions",
+    /// "Structs"), each containing a list of symbol summaries sorted by line.
+    pub groups: Vec<SymbolGroup>,
+}
+
+/// A group of symbols sharing the same kind.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SymbolGroup {
+    /// Human-readable group label, e.g. "Functions", "Structs".
+    pub kind: String,
+    /// Symbols within this group, sorted by start line.
+    pub symbols: Vec<SymbolOutlineEntry>,
+}
+
+/// A single symbol in the outline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SymbolOutlineEntry {
+    pub name: String,
+    pub signature: String,
+    pub line: usize,
+    /// Parent symbol (e.g. struct for a method).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+}
+
+/// Human-readable plural label for a `SymbolKind`.
+fn kind_label(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "Functions",
+        SymbolKind::Method => "Methods",
+        SymbolKind::Class => "Classes",
+        SymbolKind::Struct => "Structs",
+        SymbolKind::Enum => "Enums",
+        SymbolKind::Trait => "Traits",
+        SymbolKind::Interface => "Interfaces",
+        SymbolKind::Constant => "Constants",
+        SymbolKind::Variable => "Variables",
+        SymbolKind::Type => "Types",
+        SymbolKind::Module => "Modules",
+        SymbolKind::Macro => "Macros",
+        SymbolKind::Import => "Imports",
+        SymbolKind::Other => "Other",
+    }
+}
+
+/// Ordering key so that groups appear in a conventional, stable order
+/// (imports first, then types/structs/classes, then functions/methods, etc.).
+fn kind_order(kind: SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Import => 0,
+        SymbolKind::Module => 1,
+        SymbolKind::Constant => 2,
+        SymbolKind::Type => 3,
+        SymbolKind::Struct => 4,
+        SymbolKind::Class => 5,
+        SymbolKind::Enum => 6,
+        SymbolKind::Trait => 7,
+        SymbolKind::Interface => 8,
+        SymbolKind::Function => 9,
+        SymbolKind::Method => 10,
+        SymbolKind::Macro => 11,
+        SymbolKind::Variable => 12,
+        SymbolKind::Other => 13,
+    }
+}
+
+/// Generate a structured outline for a file.
+///
+/// The outline groups the file's symbols by kind, shows each symbol's
+/// signature and line number, and includes the file's language and line count.
+pub fn generate_outline(
+    root: &Path,
+    file_tree: &Arc<FileTree>,
+    symbol_table: &Arc<SymbolTable>,
+    file: &str,
+) -> Result<FileOutline, String> {
+    // Verify the file exists in the tree
+    let entry = file_tree
+        .get(file)
+        .ok_or_else(|| format!("File '{}' not found in index", file))?;
+
+    // Count lines by reading the file
+    let abs_path = root.join(file);
+    let source = std::fs::read_to_string(&abs_path)
+        .map_err(|e| format!("Failed to read '{}': {}", file, e))?;
+    let line_count = source.lines().count();
+
+    // Collect symbols for this file
+    let mut symbols = symbol_table.list_by_file(file);
+    symbols.sort_by_key(|s| (kind_order(s.kind), s.line_range.0));
+
+    // Group by kind
+    let mut groups_map: std::collections::BTreeMap<u8, (SymbolKind, Vec<SymbolOutlineEntry>)> =
+        std::collections::BTreeMap::new();
+
+    for sym in &symbols {
+        let order = kind_order(sym.kind);
+        let group = groups_map
+            .entry(order)
+            .or_insert_with(|| (sym.kind, Vec::new()));
+        group.1.push(SymbolOutlineEntry {
+            name: sym.name.clone(),
+            signature: sym.signature.clone(),
+            line: sym.line_range.0,
+            parent: sym.parent.clone(),
+        });
+    }
+
+    let groups: Vec<SymbolGroup> = groups_map
+        .into_values()
+        .map(|(kind, entries)| SymbolGroup {
+            kind: kind_label(kind).to_string(),
+            symbols: entries,
+        })
+        .collect();
+
+    Ok(FileOutline {
+        file: file.to_string(),
+        language: entry.language,
+        line_count,
+        groups,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,5 +1213,207 @@ mod tests {
             &sym,
             Some(source)
         ));
+    }
+
+    // ---- Outline tests ----
+
+    #[test]
+    fn test_kind_label_returns_correct_labels() {
+        assert_eq!(kind_label(SymbolKind::Function), "Functions");
+        assert_eq!(kind_label(SymbolKind::Struct), "Structs");
+        assert_eq!(kind_label(SymbolKind::Method), "Methods");
+        assert_eq!(kind_label(SymbolKind::Class), "Classes");
+        assert_eq!(kind_label(SymbolKind::Enum), "Enums");
+        assert_eq!(kind_label(SymbolKind::Trait), "Traits");
+        assert_eq!(kind_label(SymbolKind::Interface), "Interfaces");
+        assert_eq!(kind_label(SymbolKind::Constant), "Constants");
+        assert_eq!(kind_label(SymbolKind::Variable), "Variables");
+        assert_eq!(kind_label(SymbolKind::Type), "Types");
+        assert_eq!(kind_label(SymbolKind::Module), "Modules");
+        assert_eq!(kind_label(SymbolKind::Macro), "Macros");
+        assert_eq!(kind_label(SymbolKind::Import), "Imports");
+        assert_eq!(kind_label(SymbolKind::Other), "Other");
+    }
+
+    #[test]
+    fn test_kind_order_imports_before_functions() {
+        assert!(kind_order(SymbolKind::Import) < kind_order(SymbolKind::Function));
+        assert!(kind_order(SymbolKind::Struct) < kind_order(SymbolKind::Function));
+        assert!(kind_order(SymbolKind::Function) < kind_order(SymbolKind::Method));
+    }
+
+    #[test]
+    fn test_generate_outline_file_not_in_index() {
+        use crate::index::file_tree::FileTree;
+        use crate::symbols::SymbolTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_tree = Arc::new(FileTree::new());
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        let result = generate_outline(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "nonexistent.rs",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_generate_outline_basic() {
+        use crate::index::file_entry::FileEntry;
+        use crate::index::file_tree::FileTree;
+        use crate::symbols::SymbolTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = "fn hello() {\n    println!(\"Hello\");\n}\n\nstruct Foo {\n    bar: i32,\n}\n";
+        std::fs::write(dir.path().join("main.rs"), source).unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        file_tree.insert(FileEntry::new(
+            "main.rs".to_string(),
+            source.len() as u64,
+            chrono::Utc::now(),
+        ));
+
+        let symbol_table = Arc::new(SymbolTable::new());
+        symbol_table.insert(Symbol {
+            name: "hello".to_string(),
+            kind: SymbolKind::Function,
+            file: "main.rs".to_string(),
+            byte_range: (0, 35),
+            line_range: (1, 3),
+            language: Language::Rust,
+            signature: "fn hello()".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        });
+        symbol_table.insert(Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Struct,
+            file: "main.rs".to_string(),
+            byte_range: (37, 60),
+            line_range: (5, 7),
+            language: Language::Rust,
+            signature: "struct Foo".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        });
+
+        let outline = generate_outline(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "main.rs",
+        )
+        .unwrap();
+
+        assert_eq!(outline.file, "main.rs");
+        assert_eq!(outline.language, Language::Rust);
+        assert_eq!(outline.line_count, 7);
+        // Should have two groups: Structs and Functions (in that order)
+        assert_eq!(outline.groups.len(), 2);
+        assert_eq!(outline.groups[0].kind, "Structs");
+        assert_eq!(outline.groups[0].symbols.len(), 1);
+        assert_eq!(outline.groups[0].symbols[0].name, "Foo");
+        assert_eq!(outline.groups[0].symbols[0].line, 5);
+        assert_eq!(outline.groups[1].kind, "Functions");
+        assert_eq!(outline.groups[1].symbols.len(), 1);
+        assert_eq!(outline.groups[1].symbols[0].name, "hello");
+        assert_eq!(outline.groups[1].symbols[0].line, 1);
+    }
+
+    #[test]
+    fn test_generate_outline_empty_file() {
+        use crate::index::file_entry::FileEntry;
+        use crate::index::file_tree::FileTree;
+        use crate::symbols::SymbolTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = "// empty file\n";
+        std::fs::write(dir.path().join("empty.rs"), source).unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        file_tree.insert(FileEntry::new(
+            "empty.rs".to_string(),
+            source.len() as u64,
+            chrono::Utc::now(),
+        ));
+
+        let symbol_table = Arc::new(SymbolTable::new());
+
+        let outline = generate_outline(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "empty.rs",
+        )
+        .unwrap();
+
+        assert_eq!(outline.file, "empty.rs");
+        assert_eq!(outline.line_count, 1);
+        assert!(outline.groups.is_empty());
+    }
+
+    #[test]
+    fn test_generate_outline_preserves_parent() {
+        use crate::index::file_entry::FileEntry;
+        use crate::index::file_tree::FileTree;
+        use crate::symbols::SymbolTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = "struct Foo;\nimpl Foo {\n    fn bar(&self) {}\n}\n";
+        std::fs::write(dir.path().join("lib.rs"), source).unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        file_tree.insert(FileEntry::new(
+            "lib.rs".to_string(),
+            source.len() as u64,
+            chrono::Utc::now(),
+        ));
+
+        let symbol_table = Arc::new(SymbolTable::new());
+        symbol_table.insert(Symbol {
+            name: "Foo".to_string(),
+            kind: SymbolKind::Struct,
+            file: "lib.rs".to_string(),
+            byte_range: (0, 11),
+            line_range: (1, 1),
+            language: Language::Rust,
+            signature: "struct Foo".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        });
+        symbol_table.insert(Symbol {
+            name: "bar".to_string(),
+            kind: SymbolKind::Method,
+            file: "lib.rs".to_string(),
+            byte_range: (27, 43),
+            line_range: (3, 3),
+            language: Language::Rust,
+            signature: "fn bar(&self)".to_string(),
+            definition: None,
+            parent: Some("Foo".to_string()),
+            decorators: Vec::new(),
+        });
+
+        let outline = generate_outline(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "lib.rs",
+        )
+        .unwrap();
+
+        // Structs before Methods
+        assert_eq!(outline.groups.len(), 2);
+        assert_eq!(outline.groups[0].kind, "Structs");
+        assert_eq!(outline.groups[1].kind, "Methods");
+        assert_eq!(outline.groups[1].symbols[0].parent.as_deref(), Some("Foo"));
     }
 }

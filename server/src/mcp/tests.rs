@@ -169,7 +169,14 @@ fn test_stats_tool_registered() {
 }
 
 #[test]
-fn test_all_nine_tools_have_attributes() {
+fn test_outline_tool_registered() {
+    let attr = CoderlmMcpServer::coderlm_outline_tool_attr();
+    assert_eq!(attr.name, "coderlm_outline");
+    assert!(attr.annotations.as_ref().unwrap().read_only_hint == Some(true));
+}
+
+#[test]
+fn test_all_ten_tools_have_attributes() {
     // Verify each tool attribute function exists and produces the right name.
     let expected = vec![
         CoderlmMcpServer::coderlm_structure_tool_attr().name,
@@ -180,9 +187,10 @@ fn test_all_nine_tools_have_attributes() {
         CoderlmMcpServer::coderlm_callers_tool_attr().name,
         CoderlmMcpServer::coderlm_tests_tool_attr().name,
         CoderlmMcpServer::coderlm_symbols_tool_attr().name,
+        CoderlmMcpServer::coderlm_outline_tool_attr().name,
         CoderlmMcpServer::coderlm_stats_tool_attr().name,
     ];
-    assert_eq!(expected.len(), 9, "Expected 9 tool attributes");
+    assert_eq!(expected.len(), 10, "Expected 10 tool attributes");
 
     let names: Vec<&str> = expected.iter().map(|s| s.as_ref()).collect();
     assert!(names.contains(&"coderlm_structure"));
@@ -193,6 +201,7 @@ fn test_all_nine_tools_have_attributes() {
     assert!(names.contains(&"coderlm_callers"));
     assert!(names.contains(&"coderlm_tests"));
     assert!(names.contains(&"coderlm_symbols"));
+    assert!(names.contains(&"coderlm_outline"));
     assert!(names.contains(&"coderlm_stats"));
 }
 
@@ -374,6 +383,40 @@ async fn test_coderlm_symbols_lists_symbols() {
 }
 
 #[tokio::test]
+async fn test_coderlm_outline_returns_grouped_symbols() {
+    let (_dir, server) = setup_test_server();
+    wait_for_indexing(&server).await;
+
+    let result = server.coderlm_outline(Parameters(OutlineParams {
+        file: "main.rs".to_string(),
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result)
+        .unwrap_or_else(|e| panic!("Outline result not valid JSON: {}. Got: {}", e, result));
+    assert!(parsed["indexing_complete"].as_bool().unwrap());
+    assert_eq!(parsed["file"].as_str().unwrap(), "main.rs");
+    assert!(parsed["language"].is_string());
+    assert!(parsed["line_count"].as_u64().unwrap() > 0);
+    let groups = parsed["groups"].as_array().unwrap();
+    assert!(!groups.is_empty(), "Expected at least one symbol group");
+    // Each group should have a kind label and non-empty symbols
+    for group in groups {
+        assert!(group["kind"].is_string());
+        assert!(!group["symbols"].as_array().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_coderlm_outline_error_for_missing_file() {
+    let (_dir, server) = setup_test_server();
+    wait_for_indexing(&server).await;
+
+    let result = server.coderlm_outline(Parameters(OutlineParams {
+        file: "nonexistent.rs".to_string(),
+    }));
+    assert!(result.starts_with("Error:"), "Expected error, got: {}", result);
+}
+
+#[tokio::test]
 async fn test_coderlm_symbols_with_kind_filter() {
     let (_dir, server) = setup_test_server();
     wait_for_indexing(&server).await;
@@ -453,6 +496,18 @@ fn test_search_params_schema_has_required_q() {
     assert!(
         props.unwrap().contains_key("q"),
         "Schema should have 'q' property"
+    );
+}
+
+#[test]
+fn test_outline_params_schema_has_required_fields() {
+    let attr = CoderlmMcpServer::coderlm_outline_tool_attr();
+    let schema = &attr.input_schema;
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    assert!(props.is_some(), "Schema should have properties");
+    assert!(
+        props.unwrap().contains_key("file"),
+        "Schema should have 'file' property"
     );
 }
 

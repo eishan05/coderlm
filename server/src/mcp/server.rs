@@ -116,6 +116,13 @@ pub struct TestsParams {
     pub line: Option<usize>,
 }
 
+/// Parameters for `coderlm_outline` — get a structured file outline.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OutlineParams {
+    /// Relative path to the file to outline.
+    pub file: String,
+}
+
 /// Parameters for `coderlm_symbols` — list symbols in the index.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SymbolsParams {
@@ -357,6 +364,33 @@ impl CoderlmMcpServer {
             Ok(tests) => serde_json::to_string_pretty(&serde_json::json!({
                 "tests": tests,
                 "count": tests.len(),
+                "indexing_complete": self.project().is_indexing_complete(),
+            }))
+            .unwrap_or_else(|e| format!("Error: {}", e)),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    /// Returns a structured outline of a file, grouping symbols by kind
+    /// (Functions, Structs, Methods, etc.) with signatures and line numbers.
+    /// Use to quickly understand a file's shape without reading the full source.
+    #[tool(
+        name = "coderlm_outline",
+        annotations(read_only_hint = true, title = "File Outline")
+    )]
+    pub fn coderlm_outline(&self, params: Parameters<OutlineParams>) -> String {
+        let p = &params.0;
+        match symbol_ops::generate_outline(
+            &self.project().root,
+            &self.project().file_tree,
+            &self.project().symbol_table,
+            &p.file,
+        ) {
+            Ok(outline) => serde_json::to_string_pretty(&serde_json::json!({
+                "file": outline.file,
+                "language": outline.language,
+                "line_count": outline.line_count,
+                "groups": outline.groups,
                 "indexing_complete": self.project().is_indexing_complete(),
             }))
             .unwrap_or_else(|e| format!("Error: {}", e)),

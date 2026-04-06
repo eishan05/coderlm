@@ -89,6 +89,41 @@ impl SymbolTable {
         self.find_by_file_and_name(file, name).into_iter().next()
     }
 
+    /// Look up a symbol, requiring unambiguous results for mutating operations.
+    ///
+    /// Like `get()`, but returns an error instead of silently picking the first
+    /// match when multiple same-named symbols exist and `line` is not provided.
+    /// Use this for operations that modify symbol state (define, redefine).
+    pub fn get_unambiguous(
+        &self,
+        file: &str,
+        name: &str,
+        line: Option<usize>,
+    ) -> Result<Symbol, String> {
+        if let Some(line) = line {
+            let key = Self::make_key(file, name, line);
+            return self
+                .symbols
+                .get(&key)
+                .map(|r| r.value().clone())
+                .ok_or_else(|| format!("Symbol '{}' not found in '{}' at line {}", name, file, line));
+        }
+
+        let matches = self.find_by_file_and_name(file, name);
+        match matches.len() {
+            0 => Err(format!("Symbol '{}' not found in '{}'", name, file)),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            n => {
+                let lines: Vec<String> = matches.iter().map(|s| s.line_range.0.to_string()).collect();
+                Err(format!(
+                    "Symbol '{}' is ambiguous in '{}' ({} matches at lines {}). \
+                     Pass line= to disambiguate.",
+                    name, file, n, lines.join(", ")
+                ))
+            }
+        }
+    }
+
     /// Find all symbols matching a file and name, sorted by line number.
     pub fn find_by_file_and_name(&self, file: &str, name: &str) -> Vec<Symbol> {
         let mut results = Vec::new();
@@ -311,5 +346,59 @@ mod tests {
 
         assert!(table.get("src/foo.rs", "nonexistent", None).is_none());
         assert!(table.get("src/foo.rs", "nonexistent", Some(10)).is_none());
+    }
+
+    #[test]
+    fn test_get_unambiguous_returns_single_match() {
+        let table = SymbolTable::new();
+
+        let sym = make_symbol("build", "src/foo.rs", 10, None);
+        table.insert(sym);
+
+        let result = table.get_unambiguous("src/foo.rs", "build", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().line_range.0, 10);
+    }
+
+    #[test]
+    fn test_get_unambiguous_rejects_ambiguous_without_line() {
+        let table = SymbolTable::new();
+
+        let sym1 = make_symbol("new", "src/foo.rs", 10, Some("Foo"));
+        let sym2 = make_symbol("new", "src/foo.rs", 50, Some("Bar"));
+
+        table.insert(sym1);
+        table.insert(sym2);
+
+        let result = table.get_unambiguous("src/foo.rs", "new", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("ambiguous"));
+        assert!(err.contains("10"));
+        assert!(err.contains("50"));
+    }
+
+    #[test]
+    fn test_get_unambiguous_succeeds_with_line() {
+        let table = SymbolTable::new();
+
+        let sym1 = make_symbol("new", "src/foo.rs", 10, Some("Foo"));
+        let sym2 = make_symbol("new", "src/foo.rs", 50, Some("Bar"));
+
+        table.insert(sym1);
+        table.insert(sym2);
+
+        let result = table.get_unambiguous("src/foo.rs", "new", Some(50));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().parent.as_deref(), Some("Bar"));
+    }
+
+    #[test]
+    fn test_get_unambiguous_not_found() {
+        let table = SymbolTable::new();
+
+        let result = table.get_unambiguous("src/foo.rs", "nonexistent", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 }

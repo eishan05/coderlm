@@ -125,15 +125,17 @@ pub fn load_annotations(
     }
 
     // Apply symbol definitions — supports both new (file::name::line) and
-    // legacy (file::name) key formats.
+    // legacy (file::name) key formats. When a new-format key misses (e.g.,
+    // because the symbol moved lines), falls back to file+name matching.
     for (key, def) in &data.symbol_definitions {
         if let Some(mut sym) = symbol_table.symbols.get_mut(key) {
             // Exact match on new-format key
             sym.definition = Some(def.clone());
         } else {
-            // Try legacy key format: "file::name" (no line number).
-            // Parse the key to extract file and name, then find matching symbols.
-            if let Some((file, name)) = parse_legacy_key(key) {
+            // Key didn't match exactly. Try to recover by extracting file and
+            // name, then searching for matching symbols.
+            let file_and_name = parse_legacy_key(key).or_else(|| parse_new_format_key(key));
+            if let Some((file, name)) = file_and_name {
                 let matches = symbol_table.find_by_file_and_name(file, name);
                 if matches.len() == 1 {
                     // Unambiguous match — apply annotation
@@ -144,13 +146,17 @@ pub fn load_annotations(
                     );
                     if let Some(mut sym) = symbol_table.symbols.get_mut(&new_key) {
                         sym.definition = Some(def.clone());
+                        debug!(
+                            "Annotation key '{}' relocated to line {}",
+                            key, matches[0].line_range.0
+                        );
                     }
                 } else if matches.is_empty() {
                     debug!("Annotation for missing symbol: {}", key);
                 } else {
                     debug!(
                         "Annotation key '{}' is ambiguous ({} matches), skipping. \
-                         Re-save annotations to use the new key format.",
+                         Re-save annotations to update keys.",
                         key,
                         matches.len()
                     );
@@ -197,5 +203,16 @@ fn parse_legacy_key(key: &str) -> Option<(&str, &str)> {
             }
         }
         _ => None,
+    }
+}
+
+/// Parse a new-format key ("file::name::line") into (file, name).
+/// Returns None if the key is not in new format (i.e., the last part is not a number).
+fn parse_new_format_key(key: &str) -> Option<(&str, &str)> {
+    let parts: Vec<&str> = key.splitn(3, "::").collect();
+    if parts.len() == 3 && parts[2].parse::<usize>().is_ok() {
+        Some((parts[0], parts[1]))
+    } else {
+        None
     }
 }

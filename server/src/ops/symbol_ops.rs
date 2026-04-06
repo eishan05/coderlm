@@ -61,9 +61,9 @@ pub fn define_symbol(
     definition: &str,
     line: Option<usize>,
 ) -> Result<(), String> {
-    let sym = symbol_table
-        .get(file, symbol_name, line)
-        .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
+    // Use get_unambiguous for mutating operations: require disambiguation
+    // when multiple same-named symbols exist in the same file.
+    let sym = symbol_table.get_unambiguous(file, symbol_name, line)?;
 
     let key = SymbolTable::make_key(file, symbol_name, sym.line_range.0);
     if let Some(mut entry) = symbol_table.symbols.get_mut(&key) {
@@ -87,9 +87,9 @@ pub fn redefine_symbol(
     definition: &str,
     line: Option<usize>,
 ) -> Result<(), String> {
-    let sym = symbol_table
-        .get(file, symbol_name, line)
-        .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
+    // Use get_unambiguous for mutating operations: require disambiguation
+    // when multiple same-named symbols exist in the same file.
+    let sym = symbol_table.get_unambiguous(file, symbol_name, line)?;
 
     let key = SymbolTable::make_key(file, symbol_name, sym.line_range.0);
     if let Some(mut entry) = symbol_table.symbols.get_mut(&key) {

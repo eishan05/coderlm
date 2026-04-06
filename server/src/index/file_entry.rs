@@ -105,6 +105,11 @@ pub struct FileEntry {
     pub marks: Vec<FileMark>,
     /// Whether symbols have been extracted from this file.
     pub symbols_extracted: bool,
+    /// Whether this file exceeds the configured size limit.
+    /// Oversized files are listed in the tree so agents can see they exist,
+    /// but they are not parsed for symbols.
+    #[serde(default)]
+    pub oversized: bool,
 }
 
 impl FileEntry {
@@ -118,6 +123,7 @@ impl FileEntry {
             definition: None,
             marks: Vec::new(),
             symbols_extracted: false,
+            oversized: false,
         }
     }
 }

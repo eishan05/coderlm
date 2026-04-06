@@ -114,22 +114,28 @@ fn handle_file_change(
     };
 
     let size = metadata.len();
-    if size > max_file_size {
-        return;
-    }
 
     let modified: DateTime<Utc> = metadata
         .modified()
         .map(DateTime::from)
         .unwrap_or_else(|_| Utc::now());
 
-    // Update file tree
-    let entry = FileEntry::new(rel_path.to_string(), size, modified);
+    // Update file tree — oversized files are listed but flagged
+    let mut entry = FileEntry::new(rel_path.to_string(), size, modified);
     let language = entry.language;
+    let is_oversized = size > max_file_size;
+    entry.oversized = is_oversized;
     file_tree.insert(entry);
 
-    // Re-extract symbols
+    // Remove old symbols for this file
     symbol_table.remove_file(rel_path);
+
+    // Skip symbol extraction for oversized files
+    if is_oversized {
+        return;
+    }
+
+    // Re-extract symbols
     if language.has_tree_sitter_support() {
         match extract_symbols_from_file(root, rel_path, language) {
             Ok(symbols) => {

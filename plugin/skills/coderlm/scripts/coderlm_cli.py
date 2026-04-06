@@ -8,6 +8,7 @@ Usage:
   python3 coderlm_cli.py init [--port PORT] [--cwd PATH]
   python3 coderlm_cli.py structure [--depth N]
   python3 coderlm_cli.py symbols [--kind KIND] [--file FILE] [--limit N]
+  python3 coderlm_cli.py outline FILE
   python3 coderlm_cli.py search QUERY [--offset N] [--limit N]
   python3 coderlm_cli.py impl SYMBOL --file FILE [--line N]
   python3 coderlm_cli.py batch-impl SYMBOL:FILE [SYMBOL:FILE:LINE ...]
@@ -246,6 +247,12 @@ def cmd_symbols(args: argparse.Namespace) -> None:
     if args.limit is not None:
         params["limit"] = args.limit
     _output(_get(state, "/symbols", params))
+
+
+def cmd_outline(args: argparse.Namespace) -> None:
+    state = _load_state()
+    params = {"file": args.file}
+    _output(_get(state, "/symbols/outline", params))
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -530,6 +537,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sym.add_argument("--file", help="Filter by file path")
     p_sym.add_argument("--limit", type=int, default=None)
     p_sym.set_defaults(func=cmd_symbols)
+
+    # outline
+    p_outline = sub.add_parser("outline", help="Structured file outline grouped by symbol kind")
+    p_outline.add_argument("file", help="Relative file path")
+    p_outline.set_defaults(func=cmd_outline)
 
     # search
     p_search = sub.add_parser("search", help="Search symbols by name")

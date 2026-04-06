@@ -198,9 +198,14 @@ pub fn extract_symbols_from_file(
                 // Skip bare function_definition/class_definition nodes whose
                 // parent is a decorated_definition — those are already handled
                 // by the decorated_definition pattern and would create duplicates.
-                if let Some(parent_node) = node.parent() {
-                    if parent_node.kind() == "decorated_definition" {
-                        continue;
+                // Only skip for Function/Class kinds (not Method), since methods
+                // resolved from class-body queries have a block parent, not
+                // decorated_definition. The kind guard makes this intent explicit.
+                if matches!(kind, SymbolKind::Function | SymbolKind::Class) {
+                    if let Some(parent_node) = node.parent() {
+                        if parent_node.kind() == "decorated_definition" {
+                            continue;
+                        }
                     }
                 }
                 (node, decorators)
@@ -1197,6 +1202,90 @@ impl Foo {
         assert!(
             !json_no_dec.contains("decorators"),
             "JSON should NOT contain 'decorators' when empty (skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn test_python_decorated_class_methods_not_dropped() {
+        // Regression test: methods inside decorated classes must still be extracted.
+        // The duplicate-skip logic for decorated_definition must not suppress
+        // method symbols that happen to be inside a decorated class.
+        let source = r#"
+@dataclass
+class User:
+    name: str
+    age: int
+
+    def greet(self):
+        return f"Hello, {self.name}"
+
+    @property
+    def is_adult(self):
+        return self.age >= 18
+
+    @staticmethod
+    def default():
+        return User("anonymous", 0)
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        // The decorated class should appear exactly once
+        let users: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "User" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(users.len(), 1, "Expected exactly one class 'User'");
+        assert!(
+            users[0].decorators.contains(&"@dataclass".to_string()),
+            "Expected @dataclass on User"
+        );
+        assert!(
+            users[0].signature.starts_with("class User"),
+            "Signature should start with 'class User', got: '{}'",
+            users[0].signature
+        );
+
+        // Plain method inside decorated class
+        let greet = symbols
+            .iter()
+            .find(|s| s.name == "greet" && s.kind == SymbolKind::Method);
+        assert!(
+            greet.is_some(),
+            "Method 'greet' inside decorated class should still be extracted"
+        );
+        assert!(
+            greet.unwrap().decorators.is_empty(),
+            "Plain method 'greet' should have no decorators"
+        );
+
+        // Decorated method inside decorated class
+        let is_adult = symbols
+            .iter()
+            .find(|s| s.name == "is_adult" && s.kind == SymbolKind::Method);
+        assert!(
+            is_adult.is_some(),
+            "Decorated method 'is_adult' inside decorated class should still be extracted"
+        );
+        let is_adult = is_adult.unwrap();
+        assert!(
+            is_adult.decorators.contains(&"@property".to_string()),
+            "Expected @property on 'is_adult', got: {:?}",
+            is_adult.decorators
+        );
+
+        // Static method inside decorated class
+        let default_fn = symbols
+            .iter()
+            .find(|s| s.name == "default" && s.kind == SymbolKind::Method);
+        assert!(
+            default_fn.is_some(),
+            "Decorated method 'default' inside decorated class should still be extracted"
+        );
+        let default_fn = default_fn.unwrap();
+        assert!(
+            default_fn.decorators.contains(&"@staticmethod".to_string()),
+            "Expected @staticmethod on 'default', got: {:?}",
+            default_fn.decorators
         );
     }
 }

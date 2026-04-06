@@ -151,6 +151,13 @@ pub fn extract_symbols_from_file(
                 "const.def" => {
                     def_node = Some(cap.node);
                 }
+                "var.name" => {
+                    name = Some(text.to_string());
+                    kind = Some(SymbolKind::Variable);
+                }
+                "var.def" => {
+                    def_node = Some(cap.node);
+                }
                 "static.name" => {
                     name = Some(text.to_string());
                     kind = Some(SymbolKind::Constant);
@@ -323,6 +330,7 @@ mod tests {
             Language::Rust => "test.rs",
             Language::Scala => "Test.scala",
             Language::Python => "test.py",
+            Language::Go => "test.go",
             _ => "test.txt",
         };
         let file_path = dir.path().join(filename);
@@ -1435,6 +1443,138 @@ macro_rules! create_fn {
             macro_sym.line_range.1, 8,
             "Macro should end at line 8, got {}",
             macro_sym.line_range.1
+        );
+    }
+
+    #[test]
+    fn test_go_var_declarations_mapped_to_variable() {
+        let source = r#"
+package main
+
+var GlobalConfig string
+var MaxRetries int = 3
+
+const MaxSize = 100
+const AppName = "myapp"
+
+func main() {}
+"#;
+        let symbols = extract_from_source(source, Language::Go);
+
+        // var declarations should be SymbolKind::Variable
+        let global_config = symbols
+            .iter()
+            .find(|s| s.name == "GlobalConfig")
+            .expect("Expected to find symbol GlobalConfig");
+        assert_eq!(
+            global_config.kind,
+            SymbolKind::Variable,
+            "Go var declaration should be mapped to SymbolKind::Variable, got {:?}",
+            global_config.kind
+        );
+
+        let max_retries = symbols
+            .iter()
+            .find(|s| s.name == "MaxRetries")
+            .expect("Expected to find symbol MaxRetries");
+        assert_eq!(
+            max_retries.kind,
+            SymbolKind::Variable,
+            "Go var declaration should be mapped to SymbolKind::Variable, got {:?}",
+            max_retries.kind
+        );
+
+        // const declarations should remain SymbolKind::Constant
+        let max_size = symbols
+            .iter()
+            .find(|s| s.name == "MaxSize")
+            .expect("Expected to find symbol MaxSize");
+        assert_eq!(
+            max_size.kind,
+            SymbolKind::Constant,
+            "Go const declaration should be mapped to SymbolKind::Constant, got {:?}",
+            max_size.kind
+        );
+
+        let app_name = symbols
+            .iter()
+            .find(|s| s.name == "AppName")
+            .expect("Expected to find symbol AppName");
+        assert_eq!(
+            app_name.kind,
+            SymbolKind::Constant,
+            "Go const declaration should be mapped to SymbolKind::Constant, got {:?}",
+            app_name.kind
+        );
+
+        // main function should still be extracted
+        let main_fn = symbols
+            .iter()
+            .find(|s| s.name == "main" && s.kind == SymbolKind::Function);
+        assert!(main_fn.is_some(), "Expected to find function main");
+    }
+
+    #[test]
+    fn test_go_var_block_declarations_mapped_to_variable() {
+        let source = r#"
+package main
+
+var (
+    Timeout  int = 30
+    BasePath string
+)
+
+const (
+    Version = "1.0"
+    Debug   = false
+)
+"#;
+        let symbols = extract_from_source(source, Language::Go);
+
+        // var block entries should be SymbolKind::Variable
+        let timeout = symbols
+            .iter()
+            .find(|s| s.name == "Timeout")
+            .expect("Expected to find symbol Timeout");
+        assert_eq!(
+            timeout.kind,
+            SymbolKind::Variable,
+            "Go var block declaration should be mapped to SymbolKind::Variable, got {:?}",
+            timeout.kind
+        );
+
+        let base_path = symbols
+            .iter()
+            .find(|s| s.name == "BasePath")
+            .expect("Expected to find symbol BasePath");
+        assert_eq!(
+            base_path.kind,
+            SymbolKind::Variable,
+            "Go var block declaration should be mapped to SymbolKind::Variable, got {:?}",
+            base_path.kind
+        );
+
+        // const block entries should remain SymbolKind::Constant
+        let version = symbols
+            .iter()
+            .find(|s| s.name == "Version")
+            .expect("Expected to find symbol Version");
+        assert_eq!(
+            version.kind,
+            SymbolKind::Constant,
+            "Go const block declaration should be mapped to SymbolKind::Constant, got {:?}",
+            version.kind
+        );
+
+        let debug_sym = symbols
+            .iter()
+            .find(|s| s.name == "Debug")
+            .expect("Expected to find symbol Debug");
+        assert_eq!(
+            debug_sym.kind,
+            SymbolKind::Constant,
+            "Go const block declaration should be mapped to SymbolKind::Constant, got {:?}",
+            debug_sym.kind
         );
     }
 }

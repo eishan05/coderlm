@@ -101,6 +101,13 @@ pub fn extract_symbols_from_file(
                 "class.def" => {
                     def_node = Some(cap.node);
                 }
+                "object.name" => {
+                    name = Some(text.to_string());
+                    kind = Some(SymbolKind::Module);
+                }
+                "object.def" => {
+                    def_node = Some(cap.node);
+                }
                 "interface.name" => {
                     name = Some(text.to_string());
                     kind = Some(SymbolKind::Interface);
@@ -242,6 +249,7 @@ mod tests {
         let filename = match language {
             Language::Java => "Test.java",
             Language::Rust => "test.rs",
+            Language::Scala => "Test.scala",
             _ => "test.txt",
         };
         let file_path = dir.path().join(filename);
@@ -380,6 +388,101 @@ public class Widget {
         assert_ne!(
             classes[0].line_range, ctors[0].line_range,
             "Class and constructor should have different line ranges"
+        );
+    }
+
+    #[test]
+    fn test_scala_object_extracted_as_module() {
+        let source = r#"
+object MyApp {
+  def main(args: Array[String]): Unit = {
+    println("Hello")
+  }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Scala);
+        let obj_sym = symbols.iter().find(|s| s.name == "MyApp");
+        assert!(
+            obj_sym.is_some(),
+            "Expected to find a symbol named 'MyApp' for the Scala object"
+        );
+        let obj_sym = obj_sym.unwrap();
+        assert_eq!(
+            obj_sym.kind,
+            SymbolKind::Module,
+            "Scala object should be mapped to SymbolKind::Module"
+        );
+    }
+
+    #[test]
+    fn test_scala_object_alongside_class_and_trait() {
+        let source = r#"
+trait Greeter {
+  def greet(name: String): String
+}
+
+class DefaultGreeter extends Greeter {
+  def greet(name: String): String = s"Hello, $name"
+}
+
+object GreeterApp {
+  def main(args: Array[String]): Unit = {
+    val g = new DefaultGreeter()
+    println(g.greet("World"))
+  }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Scala);
+
+        let trait_sym = symbols.iter().find(|s| s.name == "Greeter" && s.kind == SymbolKind::Trait);
+        assert!(trait_sym.is_some(), "Expected trait Greeter");
+
+        let class_sym = symbols
+            .iter()
+            .find(|s| s.name == "DefaultGreeter" && s.kind == SymbolKind::Class);
+        assert!(class_sym.is_some(), "Expected class DefaultGreeter");
+
+        let obj_sym = symbols
+            .iter()
+            .find(|s| s.name == "GreeterApp" && s.kind == SymbolKind::Module);
+        assert!(obj_sym.is_some(), "Expected object GreeterApp as Module");
+
+        // Functions inside the object should also be extracted
+        let main_fn = symbols
+            .iter()
+            .find(|s| s.name == "main" && s.kind == SymbolKind::Function);
+        assert!(main_fn.is_some(), "Expected function main inside object");
+    }
+
+    #[test]
+    fn test_scala_companion_object_and_class() {
+        // Scala companion objects share the same name as their class.
+        // Both should be extractable with different SymbolKinds.
+        let source = r#"
+class Point(val x: Int, val y: Int)
+
+object Point {
+  def origin: Point = new Point(0, 0)
+}
+"#;
+        let symbols = extract_from_source(source, Language::Scala);
+
+        let classes: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "Point" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(classes.len(), 1, "Expected exactly one class Point");
+
+        let objects: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "Point" && s.kind == SymbolKind::Module)
+            .collect();
+        assert_eq!(objects.len(), 1, "Expected exactly one object Point as Module");
+
+        // They must have different line ranges
+        assert_ne!(
+            classes[0].line_range, objects[0].line_range,
+            "Class and companion object should have different line ranges"
         );
     }
 }

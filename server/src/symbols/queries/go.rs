@@ -27,7 +27,12 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (var_declaration
   (var_spec
-    name: (identifier) @const.name)) @const.def
+    name: (identifier) @var.name)) @var.def
+
+(var_declaration
+  (var_spec_list
+    (var_spec
+      name: (identifier) @var.name) @var.def))
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

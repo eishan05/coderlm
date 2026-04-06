@@ -249,10 +249,11 @@ fn extract_python_docstring(
 }
 
 /// Check if a string literal text is a valid triple-quoted docstring,
-/// possibly with a prefix like `r`, `u`, `b`, `rb`, `br`, etc.
+/// possibly with a prefix like `r` or `u`.
 ///
-/// F-strings (`f"..."`, `rf"..."`, etc.) cannot be docstrings per the
-/// Python spec, so any prefix containing `f`/`F` is rejected.
+/// Rejects prefixes that produce non-string types:
+/// - `f`/`F` (f-strings are formatted, not docstrings per the spec)
+/// - `b`/`B` (bytes literals are not string literals)
 fn is_triple_quoted_string(text: &str) -> bool {
     // Extract the prefix (everything before the first quote character)
     let prefix = text
@@ -260,14 +261,13 @@ fn is_triple_quoted_string(text: &str) -> bool {
         .take_while(|c| !matches!(c, '"' | '\''))
         .collect::<String>();
 
-    // Reject f-strings: any prefix containing f/F is not a valid docstring
-    if prefix.chars().any(|c| c == 'f' || c == 'F') {
-        return false;
-    }
-
-    // Only accept known valid docstring prefixes (case-insensitive)
+    // Only accept prefixes that produce actual string literals.
+    // - "" (no prefix): plain string
+    // - "r"/"R": raw string
+    // - "u"/"U": unicode string (Python 3 default, kept for compat)
+    // Rejected: b/B (bytes), f/F (f-strings), and any combinations thereof.
     let prefix_lower = prefix.to_lowercase();
-    let valid_prefixes = ["", "r", "u", "b", "rb", "br"];
+    let valid_prefixes = ["", "r", "u"];
     if !valid_prefixes.contains(&prefix_lower.as_str()) {
         return false;
     }
@@ -2609,6 +2609,30 @@ fn after_inner_block() {}
         assert!(
             sym.doc_comment.is_none(),
             "rf-strings should NOT be captured as docstrings"
+        );
+    }
+
+    #[test]
+    fn test_python_bytes_literal_not_captured_as_docstring() {
+        // Bytes literals (b"""...""") are not string literals and cannot be docstrings
+        let source = "def bytes_body():\n    b\"\"\"Not a docstring.\"\"\"\n    pass\n";
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "bytes_body").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "bytes literals (b\"\"\"...\"\"\") should NOT be captured as docstrings"
+        );
+    }
+
+    #[test]
+    fn test_python_rb_literal_not_captured_as_docstring() {
+        // rb/br bytes literals are not string literals
+        let source = "def rb_body():\n    rb\"\"\"Not a docstring.\"\"\"\n    pass\n";
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "rb_body").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "raw bytes literals (rb\"\"\"...\"\"\") should NOT be captured as docstrings"
         );
     }
 

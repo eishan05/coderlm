@@ -683,4 +683,81 @@ def helper():
             "Function-local annotated variable 'x' should NOT be a constant"
         );
     }
+
+    #[test]
+    fn test_python_bare_annotation_at_module_level() {
+        // Bare annotations like `X: int` (without assignment) are also captured
+        // because tree-sitter-python parses them as `assignment` nodes.
+        // This is acceptable: module-level annotations declare module globals.
+        let source = r#"
+X: int
+Y: str = "hello"
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let x_sym = symbols
+            .iter()
+            .find(|s| s.name == "X" && s.kind == SymbolKind::Constant);
+        assert!(
+            x_sym.is_some(),
+            "Module-level bare annotation 'X: int' should be captured as a constant"
+        );
+
+        let y_sym = symbols
+            .iter()
+            .find(|s| s.name == "Y" && s.kind == SymbolKind::Constant);
+        assert!(
+            y_sym.is_some(),
+            "Module-level annotated assignment 'Y: str = ...' should be captured as a constant"
+        );
+    }
+
+    #[test]
+    fn test_python_nested_scope_assignments_excluded() {
+        // Comprehensive test: assignments in various nested scopes
+        // should NOT appear as module-level constants
+        let source = r#"
+TOP_LEVEL = "module constant"
+
+def outer():
+    outer_local = 1
+    def inner():
+        inner_local = 2
+
+class Outer:
+    class_var = "class level"
+    class Nested:
+        nested_var = "nested class level"
+
+if True:
+    conditional_var = "inside if"
+
+for i in range(10):
+    loop_var = "inside for"
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        // Module-level constant should be found
+        let top = symbols
+            .iter()
+            .find(|s| s.name == "TOP_LEVEL" && s.kind == SymbolKind::Constant);
+        assert!(top.is_some(), "Expected module-level constant TOP_LEVEL");
+
+        // None of the nested assignments should be constants
+        for excluded_name in &[
+            "outer_local",
+            "inner_local",
+            "class_var",
+            "nested_var",
+        ] {
+            let found = symbols
+                .iter()
+                .find(|s| s.name == *excluded_name && s.kind == SymbolKind::Constant);
+            assert!(
+                found.is_none(),
+                "Nested variable '{}' should NOT be a module-level constant",
+                excluded_name
+            );
+        }
+    }
 }

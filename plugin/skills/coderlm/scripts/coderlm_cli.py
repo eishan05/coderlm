@@ -10,7 +10,9 @@ Usage:
   python3 coderlm_cli.py symbols [--kind KIND] [--file FILE] [--limit N]
   python3 coderlm_cli.py search QUERY [--offset N] [--limit N]
   python3 coderlm_cli.py impl SYMBOL --file FILE [--line N]
+  python3 coderlm_cli.py batch-impl SYMBOL:FILE [SYMBOL:FILE:LINE ...]
   python3 coderlm_cli.py callers SYMBOL --file FILE [--limit N] [--line N]
+  python3 coderlm_cli.py batch-callers SYMBOL:FILE [SYMBOL:FILE:LINE ...] [--limit N]
   python3 coderlm_cli.py tests SYMBOL --file FILE [--limit N] [--line N]
   python3 coderlm_cli.py variables FUNCTION --file FILE [--line N]
   python3 coderlm_cli.py peek FILE [--start N] [--end N]
@@ -273,6 +275,49 @@ def cmd_callers(args: argparse.Namespace) -> None:
     _output(_get(state, "/symbols/callers", params))
 
 
+def _parse_symbol_refs(refs: list[str]) -> list[dict]:
+    """Parse symbol references in 'symbol:file' or 'symbol:file:line' format."""
+    result = []
+    for ref in refs:
+        parts = ref.split(":")
+        if len(parts) < 2:
+            print(
+                f"ERROR: Invalid symbol reference '{ref}'. "
+                "Expected format: symbol:file or symbol:file:line",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        entry: dict = {"symbol": parts[0], "file": parts[1]}
+        if len(parts) >= 3:
+            try:
+                entry["line"] = int(parts[2])
+            except ValueError:
+                print(
+                    f"ERROR: Invalid line number in '{ref}'. "
+                    "Expected format: symbol:file:line (line must be integer)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        result.append(entry)
+    return result
+
+
+def cmd_batch_impl(args: argparse.Namespace) -> None:
+    """Get implementations for multiple symbols in one request."""
+    state = _load_state()
+    symbols = _parse_symbol_refs(args.refs)
+    _output(_post(state, "/symbols/implementations/batch", {"symbols": symbols}))
+
+
+def cmd_batch_callers(args: argparse.Namespace) -> None:
+    """Find callers for multiple symbols in one request."""
+    state = _load_state()
+    data: dict = {"symbols": _parse_symbol_refs(args.refs)}
+    if args.limit is not None:
+        data["limit"] = args.limit
+    _output(_post(state, "/symbols/callers/batch", data))
+
+
 def cmd_tests(args: argparse.Namespace) -> None:
     state = _load_state()
     params = {"symbol": args.symbol, "file": args.file}
@@ -468,6 +513,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_callers.add_argument("--limit", type=int, default=None)
     p_callers.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
     p_callers.set_defaults(func=cmd_callers)
+
+    # batch-impl
+    p_bimpl = sub.add_parser("batch-impl", help="Get implementations for multiple symbols at once")
+    p_bimpl.add_argument("refs", nargs="+", help="Symbol references as symbol:file or symbol:file:line")
+    p_bimpl.set_defaults(func=cmd_batch_impl)
+
+    # batch-callers
+    p_bcallers = sub.add_parser("batch-callers", help="Find callers for multiple symbols at once")
+    p_bcallers.add_argument("refs", nargs="+", help="Symbol references as symbol:file or symbol:file:line")
+    p_bcallers.add_argument("--limit", type=int, default=None, help="Max callers per symbol")
+    p_bcallers.set_defaults(func=cmd_batch_callers)
 
     # tests
     p_tests = sub.add_parser("tests", help="Find tests referencing a symbol")

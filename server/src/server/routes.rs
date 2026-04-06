@@ -98,8 +98,10 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/symbols/define", post(define_symbol))
         .route("/api/v1/symbols/redefine", post(redefine_symbol))
         .route("/api/v1/symbols/implementation", get(get_implementation))
+        .route("/api/v1/symbols/implementations/batch", post(batch_implementations))
         .route("/api/v1/symbols/tests", get(find_tests))
         .route("/api/v1/symbols/callers", get(find_callers))
+        .route("/api/v1/symbols/callers/batch", post(batch_callers))
         .route("/api/v1/symbols/variables", get(list_variables))
         // Content
         .route("/api/v1/peek", get(peek))
@@ -514,6 +516,94 @@ async fn get_implementation(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Batch implementations
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BatchImplementationRequest {
+    symbols: Vec<BatchSymbolRef>,
+}
+
+#[derive(Deserialize)]
+struct BatchSymbolRef {
+    symbol: String,
+    file: String,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
+}
+
+async fn batch_implementations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchImplementationRequest>,
+) -> Result<Json<Value>, AppError> {
+    if body.symbols.is_empty() {
+        return Err(AppError::BadRequest("'symbols' array must not be empty".into()));
+    }
+    if body.symbols.len() > 50 {
+        return Err(AppError::BadRequest(
+            "Batch size exceeds maximum of 50 symbols".into(),
+        ));
+    }
+
+    let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
+
+    let mut results: Vec<Value> = Vec::with_capacity(body.symbols.len());
+    let mut success_count = 0usize;
+    let mut error_count = 0usize;
+
+    for sym_ref in &body.symbols {
+        match symbol_ops::get_implementation(
+            &project.root,
+            &project.symbol_table,
+            &sym_ref.symbol,
+            &sym_ref.file,
+            sym_ref.line,
+        ) {
+            Ok(source) => {
+                success_count += 1;
+                results.push(json!({
+                    "symbol": sym_ref.symbol,
+                    "file": sym_ref.file,
+                    "source": source,
+                }));
+            }
+            Err(err) => {
+                error_count += 1;
+                results.push(json!({
+                    "symbol": sym_ref.symbol,
+                    "file": sym_ref.file,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    let preview = format!(
+        "batch impl: {} requested, {} ok, {} errors",
+        body.symbols.len(),
+        success_count,
+        error_count
+    );
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/symbols/implementations/batch",
+        &preview,
+    );
+
+    Ok(Json(json!({
+        "results": results,
+        "count": results.len(),
+        "successes": success_count,
+        "errors": error_count,
+        "indexing_complete": indexing_complete,
+    })))
+}
+
 #[derive(Deserialize)]
 struct TestsQuery {
     symbol: String,
@@ -576,6 +666,99 @@ async fn find_callers(
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
     record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/callers", &preview);
     Ok(Json(json!({ "callers": callers, "count": callers.len(), "indexing_complete": indexing_complete })))
+}
+
+// ---------------------------------------------------------------------------
+// Batch callers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BatchCallersRequest {
+    symbols: Vec<BatchCallersSymbolRef>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct BatchCallersSymbolRef {
+    symbol: String,
+    file: String,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
+}
+
+async fn batch_callers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchCallersRequest>,
+) -> Result<Json<Value>, AppError> {
+    if body.symbols.is_empty() {
+        return Err(AppError::BadRequest("'symbols' array must not be empty".into()));
+    }
+    if body.symbols.len() > 50 {
+        return Err(AppError::BadRequest(
+            "Batch size exceeds maximum of 50 symbols".into(),
+        ));
+    }
+
+    let project = require_project(&state, &headers)?;
+    let indexing_complete = project.is_indexing_complete();
+    let limit = body.limit.unwrap_or(50);
+
+    let mut results: Vec<Value> = Vec::with_capacity(body.symbols.len());
+    let mut success_count = 0usize;
+    let mut error_count = 0usize;
+
+    for sym_ref in &body.symbols {
+        match symbol_ops::find_callers(
+            &project.root,
+            &project.file_tree,
+            &project.symbol_table,
+            &sym_ref.symbol,
+            &sym_ref.file,
+            limit,
+            sym_ref.line,
+        ) {
+            Ok(callers) => {
+                success_count += 1;
+                results.push(json!({
+                    "symbol": sym_ref.symbol,
+                    "file": sym_ref.file,
+                    "callers": callers,
+                    "count": callers.len(),
+                }));
+            }
+            Err(err) => {
+                error_count += 1;
+                results.push(json!({
+                    "symbol": sym_ref.symbol,
+                    "file": sym_ref.file,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    let preview = format!(
+        "batch callers: {} requested, {} ok, {} errors",
+        body.symbols.len(),
+        success_count,
+        error_count
+    );
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/symbols/callers/batch",
+        &preview,
+    );
+
+    Ok(Json(json!({
+        "results": results,
+        "count": results.len(),
+        "successes": success_count,
+        "errors": error_count,
+        "indexing_complete": indexing_complete,
+    })))
 }
 
 #[derive(Deserialize)]

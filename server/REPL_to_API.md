@@ -169,6 +169,33 @@ Retrieve the full source code of a symbol (function body, struct definition, etc
 
 ---
 
+## symbol implementations (batch)
+
+Retrieve the full source code of **multiple** symbols in one request. Individual failures return an error entry instead of failing the whole request.
+
+| Method | Endpoint                          | Body                                                               |
+|--------|-----------------------------------|--------------------------------------------------------------------|
+| POST   | `/symbols/implementations/batch`  | `{ "symbols": [{"symbol":"...","file":"...","line":N}, ...] }`     |
+
+Maximum 50 symbols per request. The `line` field is optional and used for disambiguation.
+
+### Response
+
+```json
+{
+  "count": 2,
+  "successes": 1,
+  "errors": 1,
+  "indexing_complete": true,
+  "results": [
+    { "symbol": "foo", "file": "src/lib.rs", "source": "fn foo() { ... }" },
+    { "symbol": "missing", "file": "src/lib.rs", "error": "Symbol 'missing' not found in 'src/lib.rs'" }
+  ]
+}
+```
+
+---
+
 ## symbol callers
 
 Find call sites for a symbol across the codebase.
@@ -185,6 +212,33 @@ Find call sites for a symbol across the codebase.
   "callers": [
     { "file": "src/main.rs", "line": 95, "text": "index::walker::scan_directory(" },
     { "file": "src/index/watcher.rs", "line": 133, "text": "extract_symbols_from_file(root, rel_path, language) {" }
+  ]
+}
+```
+
+---
+
+## symbol callers (batch)
+
+Find callers of **multiple** symbols in one request. Individual failures return an error entry instead of failing the whole request.
+
+| Method | Endpoint                 | Body                                                                            |
+|--------|--------------------------|---------------------------------------------------------------------------------|
+| POST   | `/symbols/callers/batch` | `{ "symbols": [{"symbol":"...","file":"...","line":N}, ...], "limit": 50 }`     |
+
+Maximum 50 symbols per request. The `line` field is optional. The `limit` field applies per-symbol.
+
+### Response
+
+```json
+{
+  "count": 2,
+  "successes": 2,
+  "errors": 0,
+  "indexing_complete": true,
+  "results": [
+    { "symbol": "foo", "file": "src/lib.rs", "callers": [...], "count": 3 },
+    { "symbol": "bar", "file": "src/lib.rs", "callers": [], "count": 0 }
   ]
 }
 ```

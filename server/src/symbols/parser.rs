@@ -49,7 +49,7 @@ pub fn extract_symbols_from_file(
         let mut kind: Option<SymbolKind> = None;
         let mut def_node: Option<tree_sitter::Node> = None;
         let mut parent: Option<String> = None;
-        let mut decorators: Vec<String> = Vec::new();
+        let decorators: Vec<String> = Vec::new();
 
         for cap in m.captures {
             let cap_name = &capture_names[cap.index as usize];
@@ -170,31 +170,50 @@ pub fn extract_symbols_from_file(
         }
 
         if let (Some(name), Some(kind), Some(node)) = (name, kind, def_node) {
-            let start = node.start_position();
-            let end = node.end_position();
-            let byte_range = (node.start_byte(), node.end_byte());
-            let line_range = (start.row + 1, end.row + 1); // 1-indexed
-
-            // Extract signature (first line of the definition)
-            let node_text = node.utf8_text(source.as_bytes()).unwrap_or("");
-            let signature = node_text.lines().next().unwrap_or("").to_string();
-
-            // Extract decorators from decorated_definition nodes.
-            // When the def_node is a `decorated_definition`, walk its children
-            // to find all `decorator` child nodes.
-            if node.kind() == "decorated_definition" {
+            // For decorated_definition nodes, extract decorators from the outer
+            // node but use the inner definition child for identity metadata
+            // (byte_range, line_range, signature). This ensures the symbol's
+            // start line and signature point at the actual def/class line,
+            // not the first decorator.
+            let (identity_node, decorators) = if node.kind() == "decorated_definition" {
+                let mut decs = Vec::new();
+                let mut inner_node = node;
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     if child.kind() == "decorator" {
                         if let Ok(dec_text) = child.utf8_text(source.as_bytes()) {
                             let trimmed = dec_text.trim().to_string();
                             if !trimmed.is_empty() {
-                                decorators.push(trimmed);
+                                decs.push(trimmed);
                             }
                         }
+                    } else if child.kind() == "function_definition"
+                        || child.kind() == "class_definition"
+                    {
+                        inner_node = child;
                     }
                 }
-            }
+                (inner_node, decs)
+            } else {
+                // Skip bare function_definition/class_definition nodes whose
+                // parent is a decorated_definition — those are already handled
+                // by the decorated_definition pattern and would create duplicates.
+                if let Some(parent_node) = node.parent() {
+                    if parent_node.kind() == "decorated_definition" {
+                        continue;
+                    }
+                }
+                (node, decorators)
+            };
+
+            let start = identity_node.start_position();
+            let end = identity_node.end_position();
+            let byte_range = (identity_node.start_byte(), identity_node.end_byte());
+            let line_range = (start.row + 1, end.row + 1); // 1-indexed
+
+            // Extract signature (first line of the definition)
+            let id_text = identity_node.utf8_text(source.as_bytes()).unwrap_or("");
+            let signature = id_text.lines().next().unwrap_or("").to_string();
 
             symbols.push(Symbol {
                 name,
@@ -801,37 +820,62 @@ def from_dict(cls, data):
 "#;
         let symbols = extract_from_source(source, Language::Python);
 
-        let name_fn = symbols
+        // Each decorated function should appear exactly once (no duplicates)
+        let name_fns: Vec<_> = symbols
             .iter()
-            .find(|s| s.name == "name" && s.kind == SymbolKind::Function);
-        assert!(name_fn.is_some(), "Expected function 'name'");
-        let name_fn = name_fn.unwrap();
+            .filter(|s| s.name == "name" && s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(name_fns.len(), 1, "Expected exactly one symbol for 'name', got {}", name_fns.len());
+        let name_fn = name_fns[0];
         assert!(
             name_fn.decorators.contains(&"@property".to_string()),
             "Expected @property decorator on 'name', got: {:?}",
             name_fn.decorators
         );
+        // Signature should be the def line, not the decorator
+        assert!(
+            name_fn.signature.starts_with("def name"),
+            "Signature should start with 'def name', got: '{}'",
+            name_fn.signature
+        );
+        // line_range.0 should point at the def line (line 3), not the decorator (line 2)
+        assert_eq!(
+            name_fn.line_range.0, 3,
+            "line_range.0 should be the def line, not the decorator line"
+        );
 
-        let create_fn = symbols
+        let create_fns: Vec<_> = symbols
             .iter()
-            .find(|s| s.name == "create" && s.kind == SymbolKind::Function);
-        assert!(create_fn.is_some(), "Expected function 'create'");
-        let create_fn = create_fn.unwrap();
+            .filter(|s| s.name == "create" && s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(create_fns.len(), 1, "Expected exactly one symbol for 'create'");
+        let create_fn = create_fns[0];
         assert!(
             create_fn.decorators.contains(&"@staticmethod".to_string()),
             "Expected @staticmethod decorator on 'create', got: {:?}",
             create_fn.decorators
         );
+        assert!(
+            create_fn.signature.starts_with("def create"),
+            "Signature should start with 'def create', got: '{}'",
+            create_fn.signature
+        );
 
-        let from_dict_fn = symbols
+        let from_dict_fns: Vec<_> = symbols
             .iter()
-            .find(|s| s.name == "from_dict" && s.kind == SymbolKind::Function);
-        assert!(from_dict_fn.is_some(), "Expected function 'from_dict'");
-        let from_dict_fn = from_dict_fn.unwrap();
+            .filter(|s| s.name == "from_dict" && s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(from_dict_fns.len(), 1, "Expected exactly one symbol for 'from_dict'");
+        let from_dict_fn = from_dict_fns[0];
         assert!(
             from_dict_fn.decorators.contains(&"@classmethod".to_string()),
             "Expected @classmethod decorator on 'from_dict', got: {:?}",
             from_dict_fn.decorators
+        );
+        assert!(
+            from_dict_fn.signature.starts_with("def from_dict"),
+            "Signature should start with 'def from_dict', got: '{}'",
+            from_dict_fn.signature
         );
     }
 
@@ -952,11 +996,17 @@ def admin_dashboard():
 "#;
         let symbols = extract_from_source(source, Language::Python);
 
-        let dashboard = symbols
+        // Exactly one symbol for the function, even with 3 decorators
+        let dashboards: Vec<_> = symbols
             .iter()
-            .find(|s| s.name == "admin_dashboard" && s.kind == SymbolKind::Function);
-        assert!(dashboard.is_some(), "Expected function 'admin_dashboard'");
-        let dashboard = dashboard.unwrap();
+            .filter(|s| s.name == "admin_dashboard" && s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(
+            dashboards.len(), 1,
+            "Expected exactly one symbol for 'admin_dashboard', got {}",
+            dashboards.len()
+        );
+        let dashboard = dashboards[0];
         assert_eq!(
             dashboard.decorators.len(),
             3,
@@ -976,6 +1026,16 @@ def admin_dashboard():
             .iter()
             .any(|d| d.starts_with("@cache"));
         assert!(has_cache, "Expected @cache decorator");
+        // Signature should be the def line (line 5), not any decorator line
+        assert!(
+            dashboard.signature.starts_with("def admin_dashboard"),
+            "Signature should start with 'def admin_dashboard', got: '{}'",
+            dashboard.signature
+        );
+        assert_eq!(
+            dashboard.line_range.0, 5,
+            "line_range.0 should be the def line (5), not the first decorator line"
+        );
     }
 
     #[test]
@@ -993,22 +1053,36 @@ class Config:
 "#;
         let symbols = extract_from_source(source, Language::Python);
 
-        let point = symbols
+        // Each decorated class should appear exactly once
+        let points: Vec<_> = symbols
             .iter()
-            .find(|s| s.name == "Point" && s.kind == SymbolKind::Class);
-        assert!(point.is_some(), "Expected class 'Point'");
-        let point = point.unwrap();
+            .filter(|s| s.name == "Point" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(points.len(), 1, "Expected exactly one symbol for 'Point'");
+        let point = points[0];
         assert!(
             point.decorators.contains(&"@dataclass".to_string()),
             "Expected @dataclass on Point, got: {:?}",
             point.decorators
         );
+        // Signature should be the class line, not the decorator
+        assert!(
+            point.signature.starts_with("class Point"),
+            "Signature should start with 'class Point', got: '{}'",
+            point.signature
+        );
+        // line_range.0 should point at the class line (line 3), not decorator (line 2)
+        assert_eq!(
+            point.line_range.0, 3,
+            "line_range.0 should be the class line, not the decorator line"
+        );
 
-        let config = symbols
+        let configs: Vec<_> = symbols
             .iter()
-            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class);
-        assert!(config.is_some(), "Expected class 'Config'");
-        let config = config.unwrap();
+            .filter(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(configs.len(), 1, "Expected exactly one symbol for 'Config'");
+        let config = configs[0];
         assert_eq!(
             config.decorators.len(),
             1,
@@ -1018,6 +1092,11 @@ class Config:
             config.decorators[0].starts_with("@dataclass"),
             "Expected @dataclass decorator on Config, got: {}",
             config.decorators[0]
+        );
+        assert!(
+            config.signature.starts_with("class Config"),
+            "Signature should start with 'class Config', got: '{}'",
+            config.signature
         );
     }
 

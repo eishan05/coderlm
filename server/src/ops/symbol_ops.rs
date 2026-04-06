@@ -5,7 +5,7 @@ use tree_sitter::StreamingIterator;
 
 use crate::index::file_entry::Language;
 use crate::index::file_tree::FileTree;
-use crate::symbols::queries;
+use crate::symbols::queries::{self, TestPattern};
 use crate::symbols::symbol::{Symbol, SymbolKind};
 use crate::symbols::SymbolTable;
 
@@ -316,17 +316,19 @@ pub fn find_tests(
     // Look through all symbols for test functions
     for entry in symbol_table.symbols.iter() {
         let sym = entry.value();
-        if !is_test_symbol(sym) {
-            continue;
-        }
 
-        // Read the test function body and check if it references the target symbol
+        // Read the source for attribute checking and body-reference checking
         let abs_path = root.join(&sym.file);
         let source = match std::fs::read_to_string(&abs_path) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
+        if !is_test_symbol(sym, Some(&source)) {
+            continue;
+        }
+
+        // Check if the test function body references the target symbol
         let start = sym.byte_range.0;
         let end = sym.byte_range.1.min(source.len());
         let body = &source[start..end];
@@ -348,32 +350,67 @@ pub fn find_tests(
     Ok(tests)
 }
 
-fn is_test_symbol(sym: &Symbol) -> bool {
-    match sym.language {
-        Language::Rust => {
-            sym.name.starts_with("test") || sym.file.contains("/tests/")
+/// Check if a single `TestPattern` matches a symbol.
+///
+/// `source` is optionally provided for `Attribute` pattern matching,
+/// which needs to inspect lines preceding the symbol definition.
+fn matches_test_pattern(pattern: &TestPattern, sym: &Symbol, source: Option<&str>) -> bool {
+    match pattern {
+        TestPattern::FunctionPrefix(prefix) => sym.name.starts_with(prefix),
+
+        TestPattern::Attribute(attr) => {
+            // First check the symbol's decorator list (populated for Python)
+            if sym.decorators.iter().any(|d| d.contains(attr)) {
+                return true;
+            }
+            // For languages like Rust (#[test]) and Java (@Test), scan
+            // the source lines immediately preceding the symbol's start byte.
+            if let Some(src) = source {
+                let start = sym.byte_range.0;
+                // Look at up to 512 bytes before the symbol start for attributes
+                let scan_start = start.saturating_sub(512);
+                let prefix_text = &src[scan_start..start];
+                // Check for Rust-style #[attr] or #[something::attr]
+                if prefix_text.contains(&format!("#[{}]", attr))
+                    || prefix_text.contains(&format!("#[{}(", attr))
+                    || prefix_text.contains(&format!("::{}", attr))
+                {
+                    return true;
+                }
+                // Check for Java/Scala-style @Attr
+                if prefix_text.contains(&format!("@{}", attr)) {
+                    return true;
+                }
+            }
+            false
         }
-        Language::Python => {
-            sym.name.starts_with("test_")
-                || sym.file.contains("test_")
-                || sym.file.contains("_test.")
+
+        TestPattern::CallExpression(call_name) => {
+            // For JS/TS test frameworks: if the symbol name matches the call
+            // expression name (e.g., it(), test(), describe()), it's a test symbol.
+            // Also match symbols within files that contain these call expressions.
+            sym.name == *call_name
         }
-        Language::TypeScript | Language::JavaScript => {
-            sym.file.contains(".test.")
-                || sym.file.contains(".spec.")
-                || sym.file.contains("__tests__")
-        }
-        Language::Go => {
-            sym.name.starts_with("Test") || sym.file.ends_with("_test.go")
-        }
-        Language::Java => {
-            sym.file.contains("Test") || sym.file.contains("/test/")
-        }
-        Language::Scala => {
-            sym.file.contains("Spec") || sym.file.contains("Test") || sym.file.contains("/test/")
-        }
-        Language::Sql => false,
-        _ => false,
+
+        TestPattern::FileContains(substr) => sym.file.contains(substr),
+
+        TestPattern::FileEndsWith(suffix) => sym.file.ends_with(suffix),
+    }
+}
+
+/// Determine whether a symbol is a test symbol by consulting the language's
+/// `TestPattern` configuration from `queries::get_language_config()`.
+///
+/// Falls back to basic heuristics for languages without tree-sitter support.
+fn is_test_symbol(sym: &Symbol, source: Option<&str>) -> bool {
+    if let Some(config) = queries::get_language_config(sym.language) {
+        config
+            .test_patterns
+            .iter()
+            .any(|p| matches_test_pattern(p, sym, source))
+    } else {
+        // Fallback for languages without a LanguageConfig (e.g., SQL, C, etc.)
+        false
     }
 }
 
@@ -573,4 +610,466 @@ fn list_variables_regex(
 pub struct VariableInfo {
     pub name: String,
     pub function: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::file_entry::Language;
+    use crate::symbols::symbol::{Symbol, SymbolKind};
+
+    /// Helper to create a minimal Symbol for testing `is_test_symbol`.
+    fn make_symbol(name: &str, file: &str, language: Language) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            file: file.to_string(),
+            byte_range: (0, 100),
+            line_range: (1, 5),
+            language,
+            signature: format!("fn {}()", name),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        }
+    }
+
+    /// Helper to create a Symbol with decorators.
+    fn make_symbol_with_decorators(
+        name: &str,
+        file: &str,
+        language: Language,
+        decorators: Vec<String>,
+    ) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            file: file.to_string(),
+            byte_range: (0, 100),
+            line_range: (1, 5),
+            language,
+            signature: format!("fn {}()", name),
+            definition: None,
+            parent: None,
+            decorators,
+        }
+    }
+
+    // ---- Rust tests ----
+
+    #[test]
+    fn test_rust_function_prefix_matches_test_symbol() {
+        let sym = make_symbol("test_something", "src/lib.rs", Language::Rust);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Rust symbol with 'test' prefix should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_rust_file_in_tests_dir_matches() {
+        let sym = make_symbol("helper_setup", "src/tests/helpers.rs", Language::Rust);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Rust symbol in /tests/ directory should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_rust_attribute_test_matches() {
+        // Simulate source where #[test] attribute precedes the function
+        let source = "use std::io;\n\n#[test]\nfn my_function() {\n    assert!(true);\n}\n";
+        let sym = Symbol {
+            name: "my_function".to_string(),
+            kind: SymbolKind::Function,
+            file: "src/lib.rs".to_string(),
+            byte_range: (24, 58), // starts at "fn my_function..."
+            line_range: (4, 6),
+            language: Language::Rust,
+            signature: "fn my_function()".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        };
+        assert!(
+            is_test_symbol(&sym, Some(source)),
+            "Rust symbol preceded by #[test] should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_rust_non_test_symbol_not_matched() {
+        let sym = make_symbol("process_data", "src/main.rs", Language::Rust);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Regular Rust symbol should NOT be identified as test"
+        );
+    }
+
+    // ---- Python tests ----
+
+    #[test]
+    fn test_python_function_prefix_matches() {
+        let sym = make_symbol("test_create_user", "tests/test_user.py", Language::Python);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Python symbol with 'test_' prefix should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_python_file_with_test_prefix_matches() {
+        let sym = make_symbol("helper", "test_utils.py", Language::Python);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Python symbol in test_ file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_python_file_with_test_suffix_matches() {
+        let sym = make_symbol("helper", "utils_test.py", Language::Python);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Python symbol in _test. file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_python_non_test_symbol_not_matched() {
+        let sym = make_symbol("process", "src/main.py", Language::Python);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Regular Python symbol should NOT be identified as test"
+        );
+    }
+
+    // ---- TypeScript/JavaScript tests ----
+
+    #[test]
+    fn test_ts_file_with_test_dot_matches() {
+        let sym = make_symbol("someHelper", "src/utils.test.ts", Language::TypeScript);
+        assert!(
+            is_test_symbol(&sym, None),
+            "TypeScript symbol in .test. file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_ts_file_with_spec_dot_matches() {
+        let sym = make_symbol("someHelper", "src/utils.spec.ts", Language::TypeScript);
+        assert!(
+            is_test_symbol(&sym, None),
+            "TypeScript symbol in .spec. file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_ts_file_in_tests_dir_matches() {
+        let sym = make_symbol("someHelper", "src/__tests__/utils.ts", Language::TypeScript);
+        assert!(
+            is_test_symbol(&sym, None),
+            "TypeScript symbol in __tests__ directory should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_js_file_with_test_dot_matches() {
+        let sym = make_symbol("someHelper", "src/utils.test.js", Language::JavaScript);
+        assert!(
+            is_test_symbol(&sym, None),
+            "JavaScript symbol in .test. file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_ts_call_expression_test_matches() {
+        let sym = make_symbol("test", "src/app.test.ts", Language::TypeScript);
+        assert!(
+            is_test_symbol(&sym, None),
+            "TypeScript 'test' call expression symbol should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_ts_non_test_symbol_not_matched() {
+        let sym = make_symbol("render", "src/App.tsx", Language::TypeScript);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Regular TypeScript symbol should NOT be identified as test"
+        );
+    }
+
+    // ---- Go tests ----
+
+    #[test]
+    fn test_go_function_prefix_matches() {
+        let sym = make_symbol("TestCreateUser", "user_test.go", Language::Go);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Go symbol with 'Test' prefix should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_go_file_suffix_matches() {
+        let sym = make_symbol("helperSetup", "user_test.go", Language::Go);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Go symbol in _test.go file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_go_non_test_symbol_not_matched() {
+        let sym = make_symbol("ProcessData", "main.go", Language::Go);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Regular Go symbol should NOT be identified as test"
+        );
+    }
+
+    // ---- Java tests ----
+
+    #[test]
+    fn test_java_file_contains_test_matches() {
+        let sym = make_symbol("setUp", "src/test/java/UserTest.java", Language::Java);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Java symbol in Test file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_java_file_in_test_dir_matches() {
+        let sym = make_symbol("setUp", "src/test/java/Helper.java", Language::Java);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Java symbol in /test/ directory should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_java_attribute_test_matches() {
+        // Simulate Java source with @Test annotation
+        let source = "import org.junit.Test;\n\n@Test\npublic void myMethod() {\n}\n";
+        let sym = Symbol {
+            name: "myMethod".to_string(),
+            kind: SymbolKind::Method,
+            file: "src/main/java/App.java".to_string(),
+            byte_range: (30, 56),
+            line_range: (4, 5),
+            language: Language::Java,
+            signature: "public void myMethod()".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        };
+        assert!(
+            is_test_symbol(&sym, Some(source)),
+            "Java symbol preceded by @Test should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_java_non_test_symbol_not_matched() {
+        let sym = make_symbol("processOrder", "src/main/java/Order.java", Language::Java);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Regular Java symbol should NOT be identified as test"
+        );
+    }
+
+    // ---- Scala tests ----
+
+    #[test]
+    fn test_scala_file_contains_spec_matches() {
+        let sym = make_symbol("helper", "src/test/scala/UserSpec.scala", Language::Scala);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Scala symbol in Spec file should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_scala_function_prefix_matches() {
+        let sym = make_symbol("testSomething", "src/main/scala/App.scala", Language::Scala);
+        assert!(
+            is_test_symbol(&sym, None),
+            "Scala symbol with 'test' prefix should be identified as test"
+        );
+    }
+
+    #[test]
+    fn test_scala_non_test_symbol_not_matched() {
+        let sym = make_symbol("processData", "src/main/scala/App.scala", Language::Scala);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Regular Scala symbol should NOT be identified as test"
+        );
+    }
+
+    // ---- Languages without configs ----
+
+    #[test]
+    fn test_sql_always_returns_false() {
+        let sym = make_symbol("test_query", "migrations/test.sql", Language::Sql);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "SQL symbols should never be identified as test (no config)"
+        );
+    }
+
+    #[test]
+    fn test_other_language_always_returns_false() {
+        let sym = make_symbol("test_something", "test.txt", Language::Other);
+        assert!(
+            !is_test_symbol(&sym, None),
+            "Other language symbols should never be identified as test (no config)"
+        );
+    }
+
+    // ---- Python decorator-based matching ----
+
+    #[test]
+    fn test_python_decorator_pytest_mark() {
+        // Python with @pytest.mark.parametrize should not match unless
+        // there's a TestPattern::Attribute pattern for it. Python uses
+        // FunctionPrefix("test_"), so this should only match by name.
+        let sym = make_symbol_with_decorators(
+            "test_parametrized",
+            "src/main.py",
+            Language::Python,
+            vec!["@pytest.mark.parametrize".to_string()],
+        );
+        assert!(
+            is_test_symbol(&sym, None),
+            "Python function with test_ prefix should match even without attribute pattern"
+        );
+    }
+
+    // ---- Attribute matching edge cases ----
+
+    #[test]
+    fn test_rust_tokio_test_attribute_matches() {
+        let source = "#[tokio::test]\nasync fn my_async_test() {\n}\n";
+        let sym = Symbol {
+            name: "my_async_test".to_string(),
+            kind: SymbolKind::Function,
+            file: "src/lib.rs".to_string(),
+            byte_range: (15, 46),
+            line_range: (2, 3),
+            language: Language::Rust,
+            signature: "async fn my_async_test()".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        };
+        assert!(
+            is_test_symbol(&sym, Some(source)),
+            "Rust symbol preceded by #[tokio::test] should match via ::test pattern"
+        );
+    }
+
+    #[test]
+    fn test_matches_test_pattern_function_prefix() {
+        let sym = make_symbol("test_foo", "src/lib.rs", Language::Rust);
+        assert!(matches_test_pattern(
+            &TestPattern::FunctionPrefix("test"),
+            &sym,
+            None
+        ));
+        assert!(!matches_test_pattern(
+            &TestPattern::FunctionPrefix("spec_"),
+            &sym,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_matches_test_pattern_file_contains() {
+        let sym = make_symbol("helper", "src/__tests__/foo.ts", Language::TypeScript);
+        assert!(matches_test_pattern(
+            &TestPattern::FileContains("__tests__"),
+            &sym,
+            None
+        ));
+        assert!(!matches_test_pattern(
+            &TestPattern::FileContains(".spec."),
+            &sym,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_matches_test_pattern_file_ends_with() {
+        let sym = make_symbol("TestFoo", "pkg/foo_test.go", Language::Go);
+        assert!(matches_test_pattern(
+            &TestPattern::FileEndsWith("_test.go"),
+            &sym,
+            None
+        ));
+        assert!(!matches_test_pattern(
+            &TestPattern::FileEndsWith("_test.rs"),
+            &sym,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_matches_test_pattern_call_expression() {
+        let sym = make_symbol("test", "src/app.spec.ts", Language::TypeScript);
+        assert!(matches_test_pattern(
+            &TestPattern::CallExpression("test"),
+            &sym,
+            None
+        ));
+        assert!(!matches_test_pattern(
+            &TestPattern::CallExpression("describe"),
+            &sym,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_matches_test_pattern_attribute_via_decorators() {
+        let sym = make_symbol_with_decorators(
+            "my_method",
+            "src/test.py",
+            Language::Python,
+            vec!["@pytest.fixture".to_string()],
+        );
+        assert!(matches_test_pattern(
+            &TestPattern::Attribute("pytest.fixture"),
+            &sym,
+            None
+        ));
+        assert!(!matches_test_pattern(
+            &TestPattern::Attribute("Test"),
+            &sym,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_matches_test_pattern_attribute_via_source_scan() {
+        let source = "    @Test\n    public void foo() {}\n";
+        let sym = Symbol {
+            name: "foo".to_string(),
+            kind: SymbolKind::Method,
+            file: "Foo.java".to_string(),
+            byte_range: (10, 34),
+            line_range: (2, 2),
+            language: Language::Java,
+            signature: "public void foo()".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        };
+        assert!(matches_test_pattern(
+            &TestPattern::Attribute("Test"),
+            &sym,
+            Some(source)
+        ));
+    }
 }

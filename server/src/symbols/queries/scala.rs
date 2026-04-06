@@ -46,6 +46,9 @@ pub fn config() -> LanguageConfig {
         test_patterns: vec![
             TestPattern::CallExpression("test"),
             TestPattern::FunctionPrefix("test"),
+            TestPattern::FileContains("Spec"),
+            TestPattern::FileContains("Test"),
+            TestPattern::FileContains("/test/"),
         ],
     }
 }

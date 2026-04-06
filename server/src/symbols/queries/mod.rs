@@ -21,7 +21,6 @@ pub fn get_language_config(lang: Language) -> Option<LanguageConfig> {
     }
 }
 
-#[allow(dead_code)]
 pub struct LanguageConfig {
     pub language: tree_sitter::Language,
     pub symbols_query: &'static str,
@@ -32,12 +31,17 @@ pub struct LanguageConfig {
     pub test_patterns: Vec<TestPattern>,
 }
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub enum TestPattern {
     /// Match functions whose name starts with a prefix (e.g., "test_" in Python)
     FunctionPrefix(&'static str),
-    /// Match functions with a specific attribute/decorator (e.g., #[test] in Rust)
+    /// Match functions with a specific attribute/decorator (e.g., #[test] in Rust, @Test in Java).
+    /// Checks the symbol's `decorators` field and also scans source lines preceding the symbol.
     Attribute(&'static str),
     /// Match call expressions (e.g., it(), test(), describe() in JS/TS)
     CallExpression(&'static str),
+    /// Match symbols whose file path contains the given substring (e.g., "/tests/", ".test.", "__tests__")
+    FileContains(&'static str),
+    /// Match symbols whose file path ends with the given suffix (e.g., "_test.go")
+    FileEndsWith(&'static str),
 }

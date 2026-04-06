@@ -318,7 +318,7 @@ public class Foo {
     }
 
     #[test]
-    fn test_java_record_with_constructor_and_methods() {
+    fn test_java_record_with_compact_constructor_and_methods() {
         let source = r#"
 public record Person(String name, int age) {
     public Person {
@@ -336,8 +336,50 @@ public record Person(String name, int age) {
         let record = symbols.iter().find(|s| s.name == "Person" && s.kind == SymbolKind::Class);
         assert!(record.is_some(), "Expected record Person as Class");
 
+        // The compact constructor (record-style, no parameter list)
+        let compact_ctors: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "Person" && s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            !compact_ctors.is_empty(),
+            "Expected compact constructor Person as Method"
+        );
+
         // The method inside the record
         let method = symbols.iter().find(|s| s.name == "greeting" && s.kind == SymbolKind::Method);
         assert!(method.is_some(), "Expected method greeting");
+    }
+
+    #[test]
+    fn test_java_class_constructor_disambiguation() {
+        // Verifies that a class and its constructor (same name) coexist in the symbol table
+        // via line-number-based primary keys, and that both are individually retrievable.
+        let source = r#"
+public class Widget {
+    public Widget(int size) {
+        // constructor
+    }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Java);
+
+        let classes: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "Widget" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(classes.len(), 1, "Expected exactly one class Widget");
+
+        let ctors: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "Widget" && s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(ctors.len(), 1, "Expected exactly one constructor Widget");
+
+        // They must have different line ranges (otherwise SymbolTable keys would collide)
+        assert_ne!(
+            classes[0].line_range, ctors[0].line_range,
+            "Class and constructor should have different line ranges"
+        );
     }
 }

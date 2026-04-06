@@ -18,6 +18,9 @@ pub const SYMBOLS_QUERY: &str = r#"
 
 (constructor_declaration
   name: (identifier) @constructor.name) @constructor.def
+
+(compact_constructor_declaration
+  name: (identifier) @constructor.name) @constructor.def
 "#;
 
 pub const CALLERS_QUERY: &str = r#"

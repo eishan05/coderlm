@@ -362,6 +362,8 @@ struct SymbolDefineRequest {
     symbol: String,
     file: String,
     definition: String,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
 }
 
 async fn define_symbol(
@@ -375,6 +377,7 @@ async fn define_symbol(
         &body.symbol,
         &body.file,
         &body.definition,
+        body.line,
     )
     .map_err(AppError::BadRequest)?;
     record_history(&state, session_id(&headers).as_deref(), "POST", "/symbols/define", &body.symbol);
@@ -392,6 +395,7 @@ async fn redefine_symbol(
         &body.symbol,
         &body.file,
         &body.definition,
+        body.line,
     )
     .map_err(AppError::BadRequest)?;
     record_history(&state, session_id(&headers).as_deref(), "POST", "/symbols/redefine", &body.symbol);
@@ -402,6 +406,8 @@ async fn redefine_symbol(
 struct ImplementationQuery {
     symbol: String,
     file: String,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
 }
 
 async fn get_implementation(
@@ -415,6 +421,7 @@ async fn get_implementation(
         &project.symbol_table,
         &params.symbol,
         &params.file,
+        params.line,
     )
     .map_err(AppError::NotFound)?;
     let preview = format!("{}::{} ({} bytes)", params.file, params.symbol, source.len());
@@ -431,6 +438,8 @@ struct TestsQuery {
     symbol: String,
     file: String,
     limit: Option<usize>,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
 }
 
 async fn find_tests(
@@ -447,6 +456,7 @@ async fn find_tests(
         &params.symbol,
         &params.file,
         limit,
+        params.line,
     )
     .map_err(AppError::NotFound)?;
     let preview = format!("{} tests for {}", tests.len(), params.symbol);
@@ -459,6 +469,8 @@ struct CallersQuery {
     symbol: String,
     file: String,
     limit: Option<usize>,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
 }
 
 async fn find_callers(
@@ -475,6 +487,7 @@ async fn find_callers(
         &params.symbol,
         &params.file,
         limit,
+        params.line,
     )
     .map_err(AppError::NotFound)?;
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
@@ -486,6 +499,8 @@ async fn find_callers(
 struct VariablesQuery {
     function: String,
     file: String,
+    /// Optional line number to disambiguate same-named symbols in the same file.
+    line: Option<usize>,
 }
 
 async fn list_variables(
@@ -499,6 +514,7 @@ async fn list_variables(
         &project.symbol_table,
         &params.function,
         &params.file,
+        params.line,
     )
     .map_err(AppError::NotFound)?;
     let preview = format!("{} variables in {}", vars.len(), params.function);

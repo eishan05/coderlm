@@ -136,10 +136,10 @@ Annotate a symbol with a human-readable description. Visible to all sessions on 
 
 | REPL operation             | Method | Endpoint            | Body                                                     |
 |----------------------------|--------|---------------------|----------------------------------------------------------|
-| `symbol define $symbol`    | POST   | `/symbols/define`   | `{ "symbol": "...", "file": "...", "definition": "..." }` |
-| `symbol redefine $symbol`  | POST   | `/symbols/redefine` | `{ "symbol": "...", "file": "...", "definition": "..." }` |
+| `symbol define $symbol`    | POST   | `/symbols/define`   | `{ "symbol": "...", "file": "...", "definition": "...", "line": N }` |
+| `symbol redefine $symbol`  | POST   | `/symbols/redefine` | `{ "symbol": "...", "file": "...", "definition": "...", "line": N }` |
 
-`define` fails if a definition already exists (use `redefine` to update). Both require the file path to disambiguate symbols with the same name across files.
+`define` fails if a definition already exists (use `redefine` to update). Both require the file path to disambiguate symbols with the same name across files. The optional `line` parameter (1-indexed start line) further disambiguates when the same file has multiple symbols with the same name (e.g., methods on different impl blocks).
 
 ```bash
 curl -s -X POST -H "X-Session-Id: $SID" -H "Content-Type: application/json" \
@@ -155,7 +155,7 @@ Retrieve the full source code of a symbol (function body, struct definition, etc
 
 | REPL operation                   | Method | Endpoint                  | Params                            |
 |----------------------------------|--------|---------------------------|-----------------------------------|
-| `symbol implementation $symbol`  | GET    | `/symbols/implementation` | `?symbol=...&file=...`            |
+| `symbol implementation $symbol`  | GET    | `/symbols/implementation` | `?symbol=...&file=...&line=N`     |
 
 ### Response
 
@@ -175,7 +175,7 @@ Find call sites for a symbol across the codebase.
 
 | REPL operation            | Method | Endpoint          | Params                              |
 |---------------------------|--------|-------------------|-------------------------------------|
-| `symbol callers $symbol`  | GET    | `/symbols/callers` | `?symbol=...&file=...&limit=50`    |
+| `symbol callers $symbol`  | GET    | `/symbols/callers` | `?symbol=...&file=...&limit=50&line=N` |
 
 ### Response
 
@@ -197,7 +197,7 @@ Find test functions that reference a given symbol.
 
 | REPL operation          | Method | Endpoint         | Params                              |
 |-------------------------|--------|------------------|-------------------------------------|
-| `symbol tests $symbol`  | GET    | `/symbols/tests` | `?symbol=...&file=...&limit=20`    |
+| `symbol tests $symbol`  | GET    | `/symbols/tests` | `?symbol=...&file=...&limit=20&line=N` |
 
 ### Response
 
@@ -218,7 +218,7 @@ List local variables declared inside a function.
 
 | REPL operation                     | Method | Endpoint             | Params                          |
 |------------------------------------|--------|----------------------|---------------------------------|
-| `symbol list variables $function`  | GET    | `/symbols/variables` | `?function=...&file=...`        |
+| `symbol list variables $function`  | GET    | `/symbols/variables` | `?function=...&file=...&line=N` |
 
 ### Response
 

@@ -45,20 +45,24 @@ python3 cli symbols [--kind function] [--file src/main.rs] [--limit 50]
 python3 cli search "handler" [--limit 20]
 
 # Get full source code of a symbol
-python3 cli impl run_server --file src/main.rs
+python3 cli impl run_server --file src/main.rs [--line 69]
 
 # Find call sites
-python3 cli callers scan_directory --file src/index/walker.rs [--limit 50]
+python3 cli callers scan_directory --file src/index/walker.rs [--limit 50] [--line 15]
 
 # Find tests referencing a symbol
-python3 cli tests scan_directory --file src/index/walker.rs [--limit 20]
+python3 cli tests scan_directory --file src/index/walker.rs [--limit 20] [--line 15]
 
 # List local variables in a function
-python3 cli variables scan_directory --file src/index/walker.rs
+python3 cli variables scan_directory --file src/index/walker.rs [--line 15]
 
 # Annotate a symbol
-python3 cli define-symbol scan_directory --file src/index/walker.rs "Walks codebase respecting gitignore"
-python3 cli redefine-symbol scan_directory --file src/index/walker.rs "Updated description"
+python3 cli define-symbol scan_directory --file src/index/walker.rs [--line 15] "Walks codebase respecting gitignore"
+python3 cli redefine-symbol scan_directory --file src/index/walker.rs [--line 15] "Updated description"
+
+# Note: --line is optional and used to disambiguate when multiple symbols
+# share the same name in the same file (e.g., methods on different impl blocks).
+# Without --line, the first match by line order is returned.
 ```
 
 ### Content Operations

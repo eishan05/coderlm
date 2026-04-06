@@ -9,17 +9,17 @@ Usage:
   python3 coderlm_cli.py structure [--depth N]
   python3 coderlm_cli.py symbols [--kind KIND] [--file FILE] [--limit N]
   python3 coderlm_cli.py search QUERY [--limit N]
-  python3 coderlm_cli.py impl SYMBOL --file FILE
-  python3 coderlm_cli.py callers SYMBOL --file FILE [--limit N]
-  python3 coderlm_cli.py tests SYMBOL --file FILE [--limit N]
-  python3 coderlm_cli.py variables FUNCTION --file FILE
+  python3 coderlm_cli.py impl SYMBOL --file FILE [--line N]
+  python3 coderlm_cli.py callers SYMBOL --file FILE [--limit N] [--line N]
+  python3 coderlm_cli.py tests SYMBOL --file FILE [--limit N] [--line N]
+  python3 coderlm_cli.py variables FUNCTION --file FILE [--line N]
   python3 coderlm_cli.py peek FILE [--start N] [--end N]
   python3 coderlm_cli.py grep PATTERN [--max-matches N] [--context-lines N] [--scope all|code]
   python3 coderlm_cli.py chunks FILE [--size N] [--overlap N]
   python3 coderlm_cli.py define-file FILE DEFINITION
   python3 coderlm_cli.py redefine-file FILE DEFINITION
-  python3 coderlm_cli.py define-symbol SYMBOL --file FILE DEFINITION
-  python3 coderlm_cli.py redefine-symbol SYMBOL --file FILE DEFINITION
+  python3 coderlm_cli.py define-symbol SYMBOL --file FILE [--line N] DEFINITION
+  python3 coderlm_cli.py redefine-symbol SYMBOL --file FILE [--line N] DEFINITION
   python3 coderlm_cli.py mark FILE TYPE
   python3 coderlm_cli.py save-annotations
   python3 coderlm_cli.py load-annotations
@@ -233,6 +233,8 @@ def cmd_search(args: argparse.Namespace) -> None:
 def cmd_impl(args: argparse.Namespace) -> None:
     state = _load_state()
     params = {"symbol": args.symbol, "file": args.file}
+    if getattr(args, "line", None) is not None:
+        params["line"] = args.line
     _output(_get(state, "/symbols/implementation", params))
 
 
@@ -241,6 +243,8 @@ def cmd_callers(args: argparse.Namespace) -> None:
     params = {"symbol": args.symbol, "file": args.file}
     if args.limit is not None:
         params["limit"] = args.limit
+    if getattr(args, "line", None) is not None:
+        params["line"] = args.line
     _output(_get(state, "/symbols/callers", params))
 
 
@@ -249,12 +253,16 @@ def cmd_tests(args: argparse.Namespace) -> None:
     params = {"symbol": args.symbol, "file": args.file}
     if args.limit is not None:
         params["limit"] = args.limit
+    if getattr(args, "line", None) is not None:
+        params["line"] = args.line
     _output(_get(state, "/symbols/tests", params))
 
 
 def cmd_variables(args: argparse.Namespace) -> None:
     state = _load_state()
     params = {"function": args.function, "file": args.file}
+    if getattr(args, "line", None) is not None:
+        params["line"] = args.line
     _output(_get(state, "/symbols/variables", params))
 
 
@@ -308,20 +316,26 @@ def cmd_redefine_file(args: argparse.Namespace) -> None:
 
 def cmd_define_symbol(args: argparse.Namespace) -> None:
     state = _load_state()
-    _output(_post(state, "/symbols/define", {
+    data = {
         "symbol": args.symbol,
         "file": args.file,
         "definition": args.definition,
-    }))
+    }
+    if getattr(args, "line", None) is not None:
+        data["line"] = args.line
+    _output(_post(state, "/symbols/define", data))
 
 
 def cmd_redefine_symbol(args: argparse.Namespace) -> None:
     state = _load_state()
-    _output(_post(state, "/symbols/redefine", {
+    data = {
         "symbol": args.symbol,
         "file": args.file,
         "definition": args.definition,
-    }))
+    }
+    if getattr(args, "line", None) is not None:
+        data["line"] = args.line
+    _output(_post(state, "/symbols/redefine", data))
 
 
 def cmd_mark(args: argparse.Namespace) -> None:
@@ -409,6 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_impl = sub.add_parser("impl", help="Get full source of a symbol")
     p_impl.add_argument("symbol", help="Symbol name")
     p_impl.add_argument("--file", required=True, help="File containing the symbol")
+    p_impl.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
     p_impl.set_defaults(func=cmd_impl)
 
     # callers
@@ -416,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_callers.add_argument("symbol", help="Symbol name")
     p_callers.add_argument("--file", required=True, help="File containing the symbol")
     p_callers.add_argument("--limit", type=int, default=None)
+    p_callers.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
     p_callers.set_defaults(func=cmd_callers)
 
     # tests
@@ -423,12 +439,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_tests.add_argument("symbol", help="Symbol name")
     p_tests.add_argument("--file", required=True, help="File containing the symbol")
     p_tests.add_argument("--limit", type=int, default=None)
+    p_tests.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
     p_tests.set_defaults(func=cmd_tests)
 
     # variables
     p_vars = sub.add_parser("variables", help="List local variables in a function")
     p_vars.add_argument("function", help="Function name")
     p_vars.add_argument("--file", required=True, help="File containing the function")
+    p_vars.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named functions")
     p_vars.set_defaults(func=cmd_variables)
 
     # peek
@@ -470,6 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dsym = sub.add_parser("define-symbol", help="Set a description for a symbol")
     p_dsym.add_argument("symbol", help="Symbol name")
     p_dsym.add_argument("--file", required=True, help="File containing the symbol")
+    p_dsym.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
     p_dsym.add_argument("definition", help="Human-readable description")
     p_dsym.set_defaults(func=cmd_define_symbol)
 
@@ -477,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rdsym = sub.add_parser("redefine-symbol", help="Update a symbol description")
     p_rdsym.add_argument("symbol", help="Symbol name")
     p_rdsym.add_argument("--file", required=True, help="File containing the symbol")
+    p_rdsym.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
     p_rdsym.add_argument("definition", help="Updated description")
     p_rdsym.set_defaults(func=cmd_redefine_symbol)
 

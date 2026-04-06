@@ -39,9 +39,10 @@ pub fn get_implementation(
     symbol_table: &Arc<SymbolTable>,
     symbol_name: &str,
     file: &str,
+    line: Option<usize>,
 ) -> Result<String, String> {
     let sym = symbol_table
-        .get(file, symbol_name)
+        .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
 
     let abs_path = root.join(&sym.file);
@@ -58,16 +59,21 @@ pub fn define_symbol(
     symbol_name: &str,
     file: &str,
     definition: &str,
+    line: Option<usize>,
 ) -> Result<(), String> {
-    let key = SymbolTable::make_key(file, symbol_name);
-    if let Some(mut sym) = symbol_table.symbols.get_mut(&key) {
-        if sym.definition.is_some() {
+    let sym = symbol_table
+        .get(file, symbol_name, line)
+        .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
+
+    let key = SymbolTable::make_key(file, symbol_name, sym.line_range.0);
+    if let Some(mut entry) = symbol_table.symbols.get_mut(&key) {
+        if entry.definition.is_some() {
             return Err(format!(
                 "Symbol '{}' in '{}' already has a definition. Use redefine.",
                 symbol_name, file
             ));
         }
-        sym.definition = Some(definition.to_string());
+        entry.definition = Some(definition.to_string());
         Ok(())
     } else {
         Err(format!("Symbol '{}' not found in '{}'", symbol_name, file))
@@ -79,10 +85,15 @@ pub fn redefine_symbol(
     symbol_name: &str,
     file: &str,
     definition: &str,
+    line: Option<usize>,
 ) -> Result<(), String> {
-    let key = SymbolTable::make_key(file, symbol_name);
-    if let Some(mut sym) = symbol_table.symbols.get_mut(&key) {
-        sym.definition = Some(definition.to_string());
+    let sym = symbol_table
+        .get(file, symbol_name, line)
+        .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
+
+    let key = SymbolTable::make_key(file, symbol_name, sym.line_range.0);
+    if let Some(mut entry) = symbol_table.symbols.get_mut(&key) {
+        entry.definition = Some(definition.to_string());
         Ok(())
     } else {
         Err(format!("Symbol '{}' not found in '{}'", symbol_name, file))
@@ -98,10 +109,11 @@ pub fn find_callers(
     symbol_name: &str,
     file: &str,
     limit: usize,
+    line: Option<usize>,
 ) -> Result<Vec<CallerInfo>, String> {
     // Verify symbol exists
     let _sym = symbol_table
-        .get(file, symbol_name)
+        .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
 
     let mut callers = Vec::new();
@@ -293,9 +305,10 @@ pub fn find_tests(
     symbol_name: &str,
     file: &str,
     limit: usize,
+    line: Option<usize>,
 ) -> Result<Vec<TestInfo>, String> {
     let _sym = symbol_table
-        .get(file, symbol_name)
+        .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
 
     let mut tests = Vec::new();
@@ -379,9 +392,10 @@ pub fn list_variables(
     symbol_table: &Arc<SymbolTable>,
     function_name: &str,
     file: &str,
+    line: Option<usize>,
 ) -> Result<Vec<VariableInfo>, String> {
     let sym = symbol_table
-        .get(file, function_name)
+        .get(file, function_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", function_name, file))?;
 
     let abs_path = root.join(&sym.file);

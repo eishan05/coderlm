@@ -58,7 +58,7 @@ The server is a single-binary axum application. Key modules under `server/src/`:
   - `watcher.rs` — `notify-debouncer-mini` filesystem watcher; re-indexes changed files
   - `file_entry.rs` — `FileEntry` struct (path, size, language, definition, mark)
 - **`symbols/`** — Symbol extraction
-  - `mod.rs` — `SymbolTable` with DashMap primary store keyed by `"file::name"` and secondary indices by name and file
+  - `mod.rs` — `SymbolTable` with DashMap primary store keyed by `"file::name::line"` and secondary indices by name and file
   - `symbol.rs` — `Symbol` struct and `SymbolKind` enum
   - `parser.rs` — Runs tree-sitter on files, dispatches to per-language queries
   - `queries/` — Tree-sitter query strings per language: symbols, callers (call-expression), variables (local bindings) for Rust, Python, TypeScript, Go (JS reuses TS base)

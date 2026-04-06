@@ -65,6 +65,20 @@ python3 cli redefine-symbol scan_directory --file src/index/walker.rs [--line 15
 # Without --line, the first match by line order is returned.
 ```
 
+### Batch Operations
+
+Batch endpoints accept multiple symbols in a single request, reducing round-trips.
+Each symbol that fails (e.g., not found) returns an error in the results array
+instead of failing the whole request.
+
+```bash
+# Batch implementations: get source for multiple symbols at once
+python3 cli batch-impl foo:src/lib.rs bar:src/lib.rs baz:src/utils.rs
+
+# Batch callers: find callers for multiple symbols at once
+python3 cli batch-callers foo:src/lib.rs bar:src/lib.rs [--limit 50]
+```
+
 ### Content Operations
 
 ```bash
@@ -136,6 +150,34 @@ Same shape as symbols response.
   "symbol": "scan_directory",
   "file": "src/index/walker.rs",
   "source": "pub fn scan_directory(root: &Path) -> Result<usize> {\n    ...\n}"
+}
+```
+
+### batch-impl
+```json
+{
+  "count": 2,
+  "successes": 1,
+  "errors": 1,
+  "indexing_complete": true,
+  "results": [
+    {"symbol": "foo", "file": "src/lib.rs", "source": "fn foo() { ... }"},
+    {"symbol": "missing", "file": "src/lib.rs", "error": "Symbol 'missing' not found in 'src/lib.rs'"}
+  ]
+}
+```
+
+### batch-callers
+```json
+{
+  "count": 2,
+  "successes": 2,
+  "errors": 0,
+  "indexing_complete": true,
+  "results": [
+    {"symbol": "foo", "file": "src/lib.rs", "callers": [...], "count": 3},
+    {"symbol": "bar", "file": "src/lib.rs", "callers": [], "count": 0}
+  ]
 }
 ```
 

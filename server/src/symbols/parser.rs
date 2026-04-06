@@ -49,6 +49,7 @@ pub fn extract_symbols_from_file(
         let mut kind: Option<SymbolKind> = None;
         let mut def_node: Option<tree_sitter::Node> = None;
         let mut parent: Option<String> = None;
+        let mut decorators: Vec<String> = Vec::new();
 
         for cap in m.captures {
             let cap_name = &capture_names[cap.index as usize];
@@ -178,6 +179,23 @@ pub fn extract_symbols_from_file(
             let node_text = node.utf8_text(source.as_bytes()).unwrap_or("");
             let signature = node_text.lines().next().unwrap_or("").to_string();
 
+            // Extract decorators from decorated_definition nodes.
+            // When the def_node is a `decorated_definition`, walk its children
+            // to find all `decorator` child nodes.
+            if node.kind() == "decorated_definition" {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "decorator" {
+                        if let Ok(dec_text) = child.utf8_text(source.as_bytes()) {
+                            let trimmed = dec_text.trim().to_string();
+                            if !trimmed.is_empty() {
+                                decorators.push(trimmed);
+                            }
+                        }
+                    }
+                }
+            }
+
             symbols.push(Symbol {
                 name,
                 kind,
@@ -188,6 +206,7 @@ pub fn extract_symbols_from_file(
                 signature,
                 definition: None,
                 parent,
+                decorators,
             });
         }
     }
@@ -761,5 +780,344 @@ for i in range(10):
                 excluded_name
             );
         }
+    }
+
+    // ── Python decorator tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_python_decorated_function_simple_decorators() {
+        let source = r#"
+@property
+def name(self):
+    return self._name
+
+@staticmethod
+def create():
+    return MyClass()
+
+@classmethod
+def from_dict(cls, data):
+    return cls(**data)
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let name_fn = symbols
+            .iter()
+            .find(|s| s.name == "name" && s.kind == SymbolKind::Function);
+        assert!(name_fn.is_some(), "Expected function 'name'");
+        let name_fn = name_fn.unwrap();
+        assert!(
+            name_fn.decorators.contains(&"@property".to_string()),
+            "Expected @property decorator on 'name', got: {:?}",
+            name_fn.decorators
+        );
+
+        let create_fn = symbols
+            .iter()
+            .find(|s| s.name == "create" && s.kind == SymbolKind::Function);
+        assert!(create_fn.is_some(), "Expected function 'create'");
+        let create_fn = create_fn.unwrap();
+        assert!(
+            create_fn.decorators.contains(&"@staticmethod".to_string()),
+            "Expected @staticmethod decorator on 'create', got: {:?}",
+            create_fn.decorators
+        );
+
+        let from_dict_fn = symbols
+            .iter()
+            .find(|s| s.name == "from_dict" && s.kind == SymbolKind::Function);
+        assert!(from_dict_fn.is_some(), "Expected function 'from_dict'");
+        let from_dict_fn = from_dict_fn.unwrap();
+        assert!(
+            from_dict_fn.decorators.contains(&"@classmethod".to_string()),
+            "Expected @classmethod decorator on 'from_dict', got: {:?}",
+            from_dict_fn.decorators
+        );
+    }
+
+    #[test]
+    fn test_python_decorated_function_with_arguments() {
+        let source = r#"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/api/health")
+def health():
+    return {"status": "ok"}
+
+@app.route("/api/users", methods=["GET", "POST"])
+def users():
+    pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let health_fn = symbols
+            .iter()
+            .find(|s| s.name == "health" && s.kind == SymbolKind::Function);
+        assert!(health_fn.is_some(), "Expected function 'health'");
+        let health_fn = health_fn.unwrap();
+        assert_eq!(
+            health_fn.decorators.len(),
+            1,
+            "Expected exactly one decorator on 'health'"
+        );
+        assert!(
+            health_fn.decorators[0].contains("@app.route"),
+            "Expected @app.route decorator, got: {}",
+            health_fn.decorators[0]
+        );
+
+        let users_fn = symbols
+            .iter()
+            .find(|s| s.name == "users" && s.kind == SymbolKind::Function);
+        assert!(users_fn.is_some(), "Expected function 'users'");
+        let users_fn = users_fn.unwrap();
+        assert!(
+            users_fn.decorators[0].contains("@app.route"),
+            "Expected @app.route decorator on 'users', got: {:?}",
+            users_fn.decorators
+        );
+    }
+
+    #[test]
+    fn test_python_decorated_method_in_class() {
+        let source = r#"
+class MyClass:
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, val):
+        self._value = val
+
+    @staticmethod
+    def helper():
+        pass
+
+    def plain_method(self):
+        pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        // Decorated methods should have their decorators
+        let value_getters: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "value" && s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            !value_getters.is_empty(),
+            "Expected at least one method named 'value'"
+        );
+
+        // Check that at least one 'value' method has @property
+        let has_property = value_getters
+            .iter()
+            .any(|s| s.decorators.contains(&"@property".to_string()));
+        assert!(
+            has_property,
+            "Expected at least one 'value' method with @property decorator"
+        );
+
+        let helper = symbols
+            .iter()
+            .find(|s| s.name == "helper" && s.kind == SymbolKind::Method);
+        assert!(helper.is_some(), "Expected method 'helper'");
+        let helper = helper.unwrap();
+        assert!(
+            helper.decorators.contains(&"@staticmethod".to_string()),
+            "Expected @staticmethod on 'helper', got: {:?}",
+            helper.decorators
+        );
+
+        // Plain method should have no decorators
+        let plain = symbols
+            .iter()
+            .find(|s| s.name == "plain_method" && s.kind == SymbolKind::Method);
+        assert!(plain.is_some(), "Expected method 'plain_method'");
+        assert!(
+            plain.unwrap().decorators.is_empty(),
+            "Plain method should have no decorators"
+        );
+    }
+
+    #[test]
+    fn test_python_multiple_decorators_on_single_function() {
+        let source = r#"
+@login_required
+@admin_only
+@cache(timeout=300)
+def admin_dashboard():
+    pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let dashboard = symbols
+            .iter()
+            .find(|s| s.name == "admin_dashboard" && s.kind == SymbolKind::Function);
+        assert!(dashboard.is_some(), "Expected function 'admin_dashboard'");
+        let dashboard = dashboard.unwrap();
+        assert_eq!(
+            dashboard.decorators.len(),
+            3,
+            "Expected 3 decorators on 'admin_dashboard', got: {:?}",
+            dashboard.decorators
+        );
+        assert!(
+            dashboard.decorators.contains(&"@login_required".to_string()),
+            "Expected @login_required"
+        );
+        assert!(
+            dashboard.decorators.contains(&"@admin_only".to_string()),
+            "Expected @admin_only"
+        );
+        let has_cache = dashboard
+            .decorators
+            .iter()
+            .any(|d| d.starts_with("@cache"));
+        assert!(has_cache, "Expected @cache decorator");
+    }
+
+    #[test]
+    fn test_python_decorated_class() {
+        let source = r#"
+@dataclass
+class Point:
+    x: float
+    y: float
+
+@dataclass(frozen=True)
+class Config:
+    host: str
+    port: int
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let point = symbols
+            .iter()
+            .find(|s| s.name == "Point" && s.kind == SymbolKind::Class);
+        assert!(point.is_some(), "Expected class 'Point'");
+        let point = point.unwrap();
+        assert!(
+            point.decorators.contains(&"@dataclass".to_string()),
+            "Expected @dataclass on Point, got: {:?}",
+            point.decorators
+        );
+
+        let config = symbols
+            .iter()
+            .find(|s| s.name == "Config" && s.kind == SymbolKind::Class);
+        assert!(config.is_some(), "Expected class 'Config'");
+        let config = config.unwrap();
+        assert_eq!(
+            config.decorators.len(),
+            1,
+            "Expected 1 decorator on Config"
+        );
+        assert!(
+            config.decorators[0].starts_with("@dataclass"),
+            "Expected @dataclass decorator on Config, got: {}",
+            config.decorators[0]
+        );
+    }
+
+    #[test]
+    fn test_python_undecorated_symbols_have_empty_decorators() {
+        let source = r#"
+def plain_function():
+    pass
+
+class PlainClass:
+    def plain_method(self):
+        pass
+
+MAX_VALUE = 100
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        for sym in &symbols {
+            assert!(
+                sym.decorators.is_empty(),
+                "Symbol '{}' (kind {:?}) should have no decorators but got: {:?}",
+                sym.name,
+                sym.kind,
+                sym.decorators
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_decorators_do_not_appear_on_non_python_symbols() {
+        // Rust functions should never have decorators
+        let source = r#"
+fn hello() -> String {
+    "hello".to_string()
+}
+
+struct Foo {
+    x: i32,
+}
+
+impl Foo {
+    fn new(x: i32) -> Self {
+        Foo { x }
+    }
+}
+"#;
+        let symbols = extract_from_source(source, Language::Rust);
+        for sym in &symbols {
+            assert!(
+                sym.decorators.is_empty(),
+                "Rust symbol '{}' should have no decorators",
+                sym.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_decorator_serde_serialization() {
+        // Verify that the decorators field serializes correctly
+        let sym = Symbol {
+            name: "my_route".to_string(),
+            kind: SymbolKind::Function,
+            file: "app.py".to_string(),
+            byte_range: (0, 100),
+            line_range: (1, 5),
+            language: Language::Python,
+            signature: "def my_route():".to_string(),
+            definition: None,
+            parent: None,
+            decorators: vec!["@app.route(\"/api/test\")".to_string(), "@login_required".to_string()],
+        };
+
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(
+            json.contains("decorators"),
+            "JSON should contain 'decorators' field"
+        );
+        assert!(
+            json.contains("@app.route"),
+            "JSON should contain the decorator text"
+        );
+
+        // Also verify that empty decorators are omitted (skip_serializing_if)
+        let sym_no_dec = Symbol {
+            name: "plain".to_string(),
+            kind: SymbolKind::Function,
+            file: "app.py".to_string(),
+            byte_range: (0, 50),
+            line_range: (1, 3),
+            language: Language::Python,
+            signature: "def plain():".to_string(),
+            definition: None,
+            parent: None,
+            decorators: Vec::new(),
+        };
+
+        let json_no_dec = serde_json::to_string(&sym_no_dec).unwrap();
+        assert!(
+            !json_no_dec.contains("decorators"),
+            "JSON should NOT contain 'decorators' when empty (skip_serializing_if)"
+        );
     }
 }

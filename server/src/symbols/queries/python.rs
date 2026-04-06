@@ -1,8 +1,23 @@
 use super::{LanguageConfig, TestPattern};
 
 pub const SYMBOLS_QUERY: &str = r#"
+(decorated_definition
+  definition: (function_definition
+    name: (identifier) @function.name)) @function.def
+
 (function_definition
   name: (identifier) @function.name) @function.def
+
+(decorated_definition
+  definition: (class_definition
+    name: (identifier) @class.name)) @class.def
+
+(class_definition
+  name: (identifier) @class.name
+  body: (block
+    (decorated_definition
+      definition: (function_definition
+        name: (identifier) @method.name)) @method.def)?) @class.def
 
 (class_definition
   name: (identifier) @class.name

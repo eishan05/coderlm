@@ -191,6 +191,7 @@ mod tests {
             signature: format!("fn {}()", name),
             definition: None,
             parent: parent.map(|s| s.to_string()),
+            decorators: Vec::new(),
         }
     }
 

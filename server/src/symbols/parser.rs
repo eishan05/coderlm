@@ -248,12 +248,32 @@ fn extract_python_docstring(
     None
 }
 
-/// Check if a string literal text is triple-quoted, possibly with a prefix
-/// like `r`, `u`, `b`, `f`, `rb`, `br`, `rf`, `fr`, etc.
+/// Check if a string literal text is a valid triple-quoted docstring,
+/// possibly with a prefix like `r`, `u`, `b`, `rb`, `br`, etc.
+///
+/// F-strings (`f"..."`, `rf"..."`, etc.) cannot be docstrings per the
+/// Python spec, so any prefix containing `f`/`F` is rejected.
 fn is_triple_quoted_string(text: &str) -> bool {
-    // Strip optional string prefix characters (case-insensitive)
-    let stripped = text.trim_start_matches(|c: char| "rubfRUBF".contains(c));
-    stripped.starts_with("\"\"\"") || stripped.starts_with("'''")
+    // Extract the prefix (everything before the first quote character)
+    let prefix = text
+        .chars()
+        .take_while(|c| !matches!(c, '"' | '\''))
+        .collect::<String>();
+
+    // Reject f-strings: any prefix containing f/F is not a valid docstring
+    if prefix.chars().any(|c| c == 'f' || c == 'F') {
+        return false;
+    }
+
+    // Only accept known valid docstring prefixes (case-insensitive)
+    let prefix_lower = prefix.to_lowercase();
+    let valid_prefixes = ["", "r", "u", "b", "rb", "br"];
+    if !valid_prefixes.contains(&prefix_lower.as_str()) {
+        return false;
+    }
+
+    let after_prefix = &text[prefix.len()..];
+    after_prefix.starts_with("\"\"\"") || after_prefix.starts_with("'''")
 }
 
 /// Extract symbols from source code string.
@@ -2565,6 +2585,30 @@ fn after_inner_block() {}
         assert!(
             sym.doc_comment.as_ref().unwrap().contains("Raw docstring"),
             "Should capture raw docstring text"
+        );
+    }
+
+    #[test]
+    fn test_python_fstring_not_captured_as_docstring() {
+        // f-strings cannot be docstrings per the Python spec
+        let source = "def fstring_body():\n    f\"\"\"This is an f-string, not a docstring.\"\"\"\n    pass\n";
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "fstring_body").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "f-strings (f\"\"\"...\"\"\") should NOT be captured as docstrings"
+        );
+    }
+
+    #[test]
+    fn test_python_rf_string_not_captured_as_docstring() {
+        // rf/fr strings are also f-strings and cannot be docstrings
+        let source = "def rf_body():\n    rf\"\"\"Also not a docstring.\"\"\"\n    pass\n";
+        let symbols = extract_from_source(source, Language::Python);
+        let sym = symbols.iter().find(|s| s.name == "rf_body").unwrap();
+        assert!(
+            sym.doc_comment.is_none(),
+            "rf-strings should NOT be captured as docstrings"
         );
     }
 

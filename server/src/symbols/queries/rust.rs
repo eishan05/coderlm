@@ -77,7 +77,23 @@ pub const VARIABLES_QUERY: &str = r#"
 pub const IMPORTS_QUERY: &str = r#"
 (use_declaration
   argument: (scoped_identifier
-    path: (_) @import.source))
+    path: (scoped_identifier) @import.source))
+
+(use_declaration
+  argument: (scoped_identifier
+    path: (crate) @_crate_kw) @import.source)
+
+(use_declaration
+  argument: (scoped_identifier
+    path: (identifier) @_ident) @import.source)
+
+(use_declaration
+  argument: (scoped_identifier
+    path: (self) @_self_kw) @import.source)
+
+(use_declaration
+  argument: (scoped_identifier
+    path: (super) @_super_kw) @import.source)
 
 (use_declaration
   argument: (scoped_use_list

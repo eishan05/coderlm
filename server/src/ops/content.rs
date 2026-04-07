@@ -29,6 +29,17 @@ pub fn peek(
     }
 
     let abs_path = root.join(file);
+
+    // Safety check: ensure the resolved path stays within the project root
+    // to prevent symlink escape or path traversal attacks.
+    let canonical = std::fs::canonicalize(&abs_path)
+        .map_err(|_| format!("File '{}' not found", file))?;
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|_| format!("Project root not found"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("File '{}' not found in index", file));
+    }
+
     let source =
         std::fs::read_to_string(&abs_path).map_err(|e| format!("Failed to read '{}': {}", file, e))?;
 
@@ -36,6 +47,17 @@ pub fn peek(
     let total_lines = lines.len();
     let start = start.min(total_lines);
     let end = end.min(total_lines);
+
+    // If start >= end after clamping, return empty content
+    if start >= end {
+        return Ok(PeekResponse {
+            file: file.to_string(),
+            start_line: start + 1,
+            end_line: start,
+            total_lines,
+            content: String::new(),
+        });
+    }
 
     let content: String = lines[start..end]
         .iter()
@@ -109,6 +131,9 @@ pub fn grep_with_scope(
     context_lines: usize,
     scope: GrepScope,
 ) -> Result<GrepResponse, String> {
+    if pattern.is_empty() {
+        return Err("Pattern must not be empty".to_string());
+    }
     let re = Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
 
     let mut matches = Vec::new();
@@ -121,8 +146,22 @@ pub fn grep_with_scope(
         .collect();
     paths.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Pre-canonicalize the project root once for path-escape checks.
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|_| "Project root not found".to_string())?;
+
     for (rel_path, language) in &paths {
         let abs_path = root.join(rel_path);
+
+        // Safety check: skip files that resolve outside the project root
+        let canonical = match std::fs::canonicalize(&abs_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&canonical_root) {
+            continue;
+        }
+
         let source = match std::fs::read_to_string(&abs_path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -322,6 +361,16 @@ pub fn chunk_indices(
     }
 
     let abs_path = root.join(file);
+
+    // Safety check: ensure the resolved path stays within the project root
+    let canonical = std::fs::canonicalize(&abs_path)
+        .map_err(|_| format!("File '{}' not found", file))?;
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|_| "Project root not found".to_string())?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("File '{}' not found in index", file));
+    }
+
     let source =
         std::fs::read_to_string(&abs_path).map_err(|e| format!("Failed to read '{}': {}", file, e))?;
 
@@ -348,4 +397,69 @@ pub fn chunk_indices(
         overlap,
         chunks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::file_entry::{FileEntry, Language};
+    use crate::index::file_tree::FileTree;
+    use std::io::Write;
+
+    /// Helper: create a temp file and a FileTree that knows about it.
+    fn setup_temp_file(content: &str) -> (tempfile::TempDir, Arc<FileTree>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.rs");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+
+        let file_tree = Arc::new(FileTree::new());
+        let entry = FileEntry {
+            rel_path: "test.rs".to_string(),
+            size: content.len() as u64,
+            language: Language::Rust,
+            definition: None,
+            marks: Vec::new(),
+            symbols_extracted: false,
+            oversized: false,
+            modified: chrono::Utc::now(),
+        };
+        file_tree.files.insert("test.rs".to_string(), entry);
+
+        (dir, file_tree, "test.rs".to_string())
+    }
+
+    #[test]
+    fn test_peek_start_greater_than_end_returns_empty() {
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        let (dir, file_tree, file) = setup_temp_file(content);
+        let result = peek(dir.path(), &file_tree, &file, 20, 10).unwrap();
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_peek_start_equals_end_returns_empty() {
+        let content = "line1\nline2\nline3\n";
+        let (dir, file_tree, file) = setup_temp_file(content);
+        let result = peek(dir.path(), &file_tree, &file, 5, 5).unwrap();
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_peek_past_eof_clamped() {
+        let content = "line1\nline2\n";
+        let (dir, file_tree, file) = setup_temp_file(content);
+        // File has 2 lines; start=100, end=200 should both clamp and return empty
+        let result = peek(dir.path(), &file_tree, &file, 100, 200).unwrap();
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_peek_normal_range() {
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        let (dir, file_tree, file) = setup_temp_file(content);
+        let result = peek(dir.path(), &file_tree, &file, 0, 3).unwrap();
+        assert!(!result.content.is_empty());
+        assert_eq!(result.total_lines, 5);
+    }
 }

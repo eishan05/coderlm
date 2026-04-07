@@ -438,7 +438,26 @@ async fn list_symbols(
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
     let indexing_complete = project.is_indexing_complete();
-    let kind_filter = params.kind.as_deref().and_then(SymbolKind::from_str);
+    // Validate file exists in index when a file filter is provided
+    if let Some(ref file) = params.file {
+        if project.file_tree.get(file).is_none() {
+            return Err(AppError::NotFound(format!("File '{}' not found in index", file)));
+        }
+    }
+    let kind_filter = match params.kind.as_deref() {
+        Some(k) => {
+            let parsed = SymbolKind::from_str(k);
+            if parsed.is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "Invalid symbol kind '{}'. Valid kinds: function, method, class, struct, \
+                     enum, trait, interface, constant, variable, type, module, macro, import",
+                    k
+                )));
+            }
+            parsed
+        }
+        None => None,
+    };
     let limit = params.limit.unwrap_or(100);
     let results = symbol_ops::list_symbols(
         &project.symbol_table,
@@ -544,7 +563,7 @@ async fn get_implementation(
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
     let indexing_complete = project.is_indexing_complete();
-    let source = symbol_ops::get_implementation(
+    let impl_result = symbol_ops::get_implementation(
         &project.root,
         &project.symbol_table,
         &params.symbol,
@@ -553,19 +572,26 @@ async fn get_implementation(
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let sid = session_id(&headers);
-    let preview = format!("{}::{} ({} bytes)", params.file, params.symbol, source.len());
+    let preview = format!("{}::{} ({} bytes)", params.file, params.symbol, impl_result.source.len());
     record_history(&state, sid.as_deref(), "GET", "/symbols/implementation", &preview);
     // Track token savings: chars served (impl snippet) vs full file
     let full_file_chars = project.file_tree.get(&params.file)
         .map(|e| e.size)
-        .unwrap_or(source.len() as u64);
-    record_impl_stats(&state, sid.as_deref(), source.len() as u64, full_file_chars);
-    Ok(Json(json!({
+        .unwrap_or(impl_result.source.len() as u64);
+    record_impl_stats(&state, sid.as_deref(), impl_result.source.len() as u64, full_file_chars);
+    let mut response = json!({
         "symbol": params.symbol,
         "file": params.file,
-        "source": source,
+        "source": impl_result.source,
         "indexing_complete": indexing_complete,
-    })))
+    });
+    if let Some(warning) = impl_result.warning {
+        response["warning"] = json!(warning);
+    }
+    if let Some(candidates) = impl_result.candidates {
+        response["candidates"] = json!(candidates);
+    }
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------
@@ -616,18 +642,25 @@ async fn batch_implementations(
             &sym_ref.file,
             sym_ref.line,
         ) {
-            Ok(source) => {
+            Ok(impl_result) => {
                 success_count += 1;
                 let full_file_chars = project.file_tree.get(&sym_ref.file)
                     .map(|e| e.size)
-                    .unwrap_or(source.len() as u64);
-                total_chars_served += source.len() as u64;
+                    .unwrap_or(impl_result.source.len() as u64);
+                total_chars_served += impl_result.source.len() as u64;
                 total_chars_full_file += full_file_chars;
-                results.push(json!({
+                let mut entry = json!({
                     "symbol": sym_ref.symbol,
                     "file": sym_ref.file,
-                    "source": source,
-                }));
+                    "source": impl_result.source,
+                });
+                if let Some(warning) = impl_result.warning {
+                    entry["warning"] = json!(warning);
+                }
+                if let Some(candidates) = impl_result.candidates {
+                    entry["candidates"] = json!(candidates);
+                }
+                results.push(entry);
             }
             Err(err) => {
                 error_count += 1;
@@ -948,6 +981,7 @@ async fn peek(
 #[derive(Deserialize)]
 struct GrepQuery {
     pattern: String,
+    #[serde(alias = "limit")]
     max_matches: Option<usize>,
     context_lines: Option<usize>,
     /// Optional scope filter: "all" (default) or "code" (skip comments/strings).
@@ -1002,7 +1036,7 @@ async fn chunk_indices(
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
     let size = params.size.unwrap_or(5000);
-    let overlap = params.overlap.unwrap_or(200);
+    let overlap = params.overlap.unwrap_or(0);
     let result = content::chunk_indices(
         &project.root,
         &project.file_tree,
@@ -1107,7 +1141,8 @@ async fn get_file_imports(
     Query(params): Query<ImportsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
-    let result = imports::get_imports(&project.import_table, &params.file);
+    let result = imports::get_imports(&project.import_table, &params.file, Some(&project.file_tree))
+        .map_err(AppError::NotFound)?;
     record_history(
         &state,
         session_id(&headers).as_deref(),
@@ -1129,7 +1164,8 @@ async fn get_file_dependents(
     Query(params): Query<DependentsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
-    let result = imports::get_dependents(&project.import_table, &params.file);
+    let result = imports::get_dependents(&project.import_table, &params.file)
+        .map_err(AppError::BadRequest)?;
     record_history(
         &state,
         session_id(&headers).as_deref(),

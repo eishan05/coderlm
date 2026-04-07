@@ -39,13 +39,31 @@ pub fn search_symbols(
     symbol_table.search(query, offset, limit)
 }
 
+/// Result of a symbol implementation lookup, including optional ambiguity info.
+#[derive(Debug, serde::Serialize)]
+pub struct ImplResult {
+    pub source: String,
+    /// Warning when multiple same-named symbols exist and no line was specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// Candidate symbols when ambiguous.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<ImplCandidate>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ImplCandidate {
+    pub line: usize,
+    pub parent: Option<String>,
+}
+
 pub fn get_implementation(
     root: &Path,
     symbol_table: &Arc<SymbolTable>,
     symbol_name: &str,
     file: &str,
     line: Option<usize>,
-) -> Result<String, String> {
+) -> Result<ImplResult, String> {
     let sym = symbol_table
         .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
@@ -56,7 +74,40 @@ pub fn get_implementation(
 
     let start = sym.byte_range.0;
     let end = sym.byte_range.1.min(source.len());
-    Ok(source[start..end].to_string())
+    if start >= source.len() {
+        return Err(format!(
+            "Symbol '{}' source is stale (byte_range start {} >= file length {}). File has been modified.",
+            symbol_name, start, source.len()
+        ));
+    }
+
+    // Check for ambiguity when no line hint was provided
+    let (warning, candidates) = if line.is_none() {
+        let matches = symbol_table.find_by_file_and_name(file, symbol_name);
+        if matches.len() > 1 {
+            let cands: Vec<ImplCandidate> = matches.iter().map(|s| ImplCandidate {
+                line: s.line_range.0,
+                parent: s.parent.clone(),
+            }).collect();
+            (
+                Some(format!(
+                    "{} matches found, returning first. Use 'line' to disambiguate.",
+                    matches.len()
+                )),
+                Some(cands),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(ImplResult {
+        source: source[start..end].to_string(),
+        warning,
+        candidates,
+    })
 }
 
 pub fn define_symbol(
@@ -121,11 +172,22 @@ pub fn find_callers(
         .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
 
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut callers = Vec::new();
 
     for entry in file_tree.files.iter() {
         let rel_path = entry.key().clone();
         let language = entry.value().language;
+
+        // Skip documentation files from regex fallback — they produce
+        // false positives (prose mentions, code examples in markdown).
+        if !language.has_tree_sitter_support() && is_documentation_file(&rel_path) {
+            continue;
+        }
+
         let abs_path = root.join(&rel_path);
 
         let source = match std::fs::read_to_string(&abs_path) {
@@ -225,9 +287,10 @@ fn find_callers_regex(
     source: &str,
     rel_path: &str,
     symbol_name: &str,
-    definition_file: &str,
+    _definition_file: &str,
 ) -> Vec<CallerInfo> {
-    let pattern = match regex::Regex::new(&regex::escape(symbol_name)) {
+    // Use word boundaries to avoid matching substrings (e.g. "foo" inside "foobar")
+    let pattern = match regex::Regex::new(&format!(r"\b{}\b", regex::escape(symbol_name))) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
@@ -236,17 +299,11 @@ fn find_callers_regex(
 
     for (line_num, line) in source.lines().enumerate() {
         if pattern.is_match(line) {
-            // Skip the definition itself
-            if rel_path == definition_file
-                && (line.contains(&format!("fn {}", symbol_name))
-                    || line.contains(&format!("def {}", symbol_name))
-                    || line.contains(&format!("function {}", symbol_name))
-                    || line.contains(&format!("func {}", symbol_name))
-                    || line.contains(&format!("class {}", symbol_name))
-                    || line.contains(&format!("interface {}", symbol_name))
-                    || line.contains(&format!("object {}", symbol_name))
-                    || line.contains(&format!("trait {}", symbol_name)))
-            {
+            // Skip definitions in ANY file — not just the file where the symbol
+            // was originally defined. Other files may contain copies or
+            // re-definitions of the same name (e.g. a shell script embedding
+            // Python code).
+            if is_definition_line_regex(line, symbol_name) {
                 continue;
             }
 
@@ -259,6 +316,29 @@ fn find_callers_regex(
     }
 
     callers
+}
+
+/// Language-agnostic check for whether a line looks like a definition of
+/// the given symbol name. Used by the regex caller fallback to filter out
+/// definitions across all files.
+fn is_definition_line_regex(line: &str, name: &str) -> bool {
+    let trimmed = line.trim();
+    // Common definition keywords across languages
+    trimmed.contains(&format!("fn {}", name))
+        || trimmed.contains(&format!("def {}", name))
+        || trimmed.contains(&format!("function {}", name))
+        || trimmed.contains(&format!("func {}", name))
+        || trimmed.contains(&format!("class {}", name))
+        || trimmed.contains(&format!("interface {}", name))
+        || trimmed.contains(&format!("object {}", name))
+        || trimmed.contains(&format!("trait {}", name))
+        || trimmed.contains(&format!("type {}", name))
+        || trimmed.contains(&format!("enum {}", name))
+        || trimmed.contains(&format!("struct {}", name))
+        || trimmed.contains(&format!("const {}", name))
+        || trimmed.contains(&format!("let {}", name))
+        || trimmed.contains(&format!("var {}", name))
+        || trimmed.contains(&format!("val {}", name))
 }
 
 fn is_definition_line(line: &str, name: &str, language: Language) -> bool {
@@ -295,6 +375,17 @@ fn is_definition_line(line: &str, name: &str, language: Language) -> bool {
     }
 }
 
+/// Check if a file path refers to a documentation file (Markdown, text, etc.)
+/// that should be excluded from regex-based caller detection.
+fn is_documentation_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".md")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".rst")
+        || lower.ends_with(".adoc")
+        || lower.ends_with(".rdoc")
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct CallerInfo {
     pub file: String,
@@ -316,6 +407,10 @@ pub fn find_tests(
         .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
 
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut tests = Vec::new();
 
     // Look through all symbols for test functions
@@ -336,9 +431,13 @@ pub fn find_tests(
         // Check if the test function body references the target symbol
         let start = sym.byte_range.0;
         let end = sym.byte_range.1.min(source.len());
+        // Guard against stale byte ranges after file modification
+        if start >= source.len() {
+            continue;
+        }
         let body = &source[start..end];
 
-        if body.contains(symbol_name) {
+        if contains_word(body, symbol_name) {
             tests.push(TestInfo {
                 name: sym.name.clone(),
                 file: sym.file.clone(),
@@ -371,7 +470,7 @@ fn matches_test_pattern(pattern: &TestPattern, sym: &Symbol, source: Option<&str
             // For languages like Rust (#[test]) and Java (@Test), scan
             // the source lines immediately preceding the symbol's start byte.
             if let Some(src) = source {
-                let start = sym.byte_range.0;
+                let start = sym.byte_range.0.min(src.len());
                 // Look at up to 512 bytes before the symbol start for attributes
                 let scan_start = start.saturating_sub(512);
                 let prefix_text = &src[scan_start..start];
@@ -419,6 +518,35 @@ fn is_test_symbol(sym: &Symbol, source: Option<&str>) -> bool {
     }
 }
 
+/// Check if `haystack` contains `needle` as a whole word (not as a substring
+/// of a larger identifier). A word boundary is defined as: start/end of string,
+/// or any character that is not alphanumeric or underscore.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack_bytes = haystack.as_bytes();
+    let needle_len = needle.len();
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0 || {
+            let c = haystack_bytes[abs_pos - 1];
+            !c.is_ascii_alphanumeric() && c != b'_'
+        };
+        let after_pos = abs_pos + needle_len;
+        let after_ok = after_pos >= haystack.len() || {
+            let c = haystack_bytes[after_pos];
+            !c.is_ascii_alphanumeric() && c != b'_'
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct TestInfo {
     pub name: String,
@@ -446,6 +574,13 @@ pub fn list_variables(
 
     let start = sym.byte_range.0;
     let end = sym.byte_range.1.min(source.len());
+
+    if start >= source.len() {
+        return Err(format!(
+            "Symbol '{}' source is stale (byte_range start {} >= file length {}). File has been modified.",
+            function_name, start, source.len()
+        ));
+    }
 
     let variables = if sym.language.has_tree_sitter_support() {
         list_variables_ast(&source, sym.language, start, end, function_name)
@@ -1425,5 +1560,107 @@ mod tests {
         assert_eq!(outline.groups[0].kind, "Structs");
         assert_eq!(outline.groups[1].kind, "Methods");
         assert_eq!(outline.groups[1].symbols[0].parent.as_deref(), Some("Foo"));
+    }
+
+    // -----------------------------------------------------------------------
+    // contains_word tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_contains_word_exact_match() {
+        assert!(contains_word("health", "health"));
+    }
+
+    #[test]
+    fn test_contains_word_in_function_call() {
+        assert!(contains_word("    health_check()", "health_check"));
+    }
+
+    #[test]
+    fn test_contains_word_not_substring() {
+        // "health" should NOT match inside "health_check"
+        assert!(!contains_word("health_check()", "health"));
+    }
+
+    #[test]
+    fn test_contains_word_preceded_by_non_alnum() {
+        assert!(contains_word("call(health)", "health"));
+        assert!(contains_word("self.health", "health"));
+    }
+
+    #[test]
+    fn test_contains_word_not_part_of_longer_word() {
+        assert!(!contains_word("unhealthy", "health"));
+    }
+
+    #[test]
+    fn test_contains_word_empty_needle() {
+        assert!(!contains_word("anything", ""));
+    }
+
+    #[test]
+    fn test_contains_word_at_start_of_string() {
+        assert!(contains_word("health()", "health"));
+    }
+
+    #[test]
+    fn test_contains_word_at_end_of_string() {
+        assert!(contains_word("call health", "health"));
+    }
+
+    #[test]
+    fn test_contains_word_multiple_occurrences() {
+        // First occurrence is part of longer word, second is standalone
+        assert!(contains_word("health_check and health", "health"));
+    }
+
+    #[test]
+    fn test_find_callers_regex_skips_definition_in_other_file() {
+        // Reproduces the false-positive bug: a shell script embeds Python code
+        // containing `def diff_drive_command(...)`. The regex fallback should
+        // NOT report this definition as a caller.
+        let shell_source = r#"#!/bin/bash
+# some shell code
+cat << 'EOF' > /tmp/drive.py
+
+def diff_drive_command(linear_x, angular_z, wheel_separation=0.24, wheel_radius=0.04):
+    """Convert (linear_x m/s, angular_z rad/s) to wheel velocities."""
+    left_vel = (linear_x - angular_z * wheel_separation / 2) / wheel_radius
+    right_vel = (linear_x + angular_z * wheel_separation / 2) / wheel_radius
+    return left_vel, right_vel
+
+result = diff_drive_command(0.5, 0.1)
+EOF
+"#;
+        let callers = find_callers_regex(
+            shell_source,
+            "setup-runpod.sh",
+            "diff_drive_command",
+            "src/drive_robot.py", // definition is in a DIFFERENT file
+        );
+
+        // Should find the call site but NOT the definition
+        assert_eq!(callers.len(), 1, "Expected 1 caller, got: {:?}", callers);
+        assert!(
+            callers[0].text.contains("result = diff_drive_command"),
+            "Expected call site, got: {}",
+            callers[0].text
+        );
+    }
+
+    #[test]
+    fn test_is_definition_line_regex_matches_common_patterns() {
+        assert!(is_definition_line_regex("def foo(x, y):", "foo"));
+        assert!(is_definition_line_regex("  def foo(self):", "foo"));
+        assert!(is_definition_line_regex("fn foo() -> i32 {", "foo"));
+        assert!(is_definition_line_regex("function foo() {", "foo"));
+        assert!(is_definition_line_regex("func foo(a int) {", "foo"));
+        assert!(is_definition_line_regex("class foo:", "foo"));
+        assert!(is_definition_line_regex("struct foo {", "foo"));
+        assert!(is_definition_line_regex("const foo = 42;", "foo"));
+        // Should NOT match call sites
+        assert!(!is_definition_line_regex("result = foo(1, 2)", "foo"));
+        assert!(!is_definition_line_regex("let x = foo();", "foo"));
+        assert!(!is_definition_line_regex("print(foo(bar))", "foo"));
     }
 }

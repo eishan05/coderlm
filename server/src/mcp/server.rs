@@ -264,13 +264,22 @@ impl CoderlmMcpServer {
             &p.file,
             p.line,
         ) {
-            Ok(source) => serde_json::to_string_pretty(&serde_json::json!({
-                "symbol": p.symbol,
-                "file": p.file,
-                "source": source,
-                "indexing_complete": self.project().is_indexing_complete(),
-            }))
-            .unwrap_or_else(|e| format!("Error: {}", e)),
+            Ok(impl_result) => {
+                let mut response = serde_json::json!({
+                    "symbol": p.symbol,
+                    "file": p.file,
+                    "source": impl_result.source,
+                    "indexing_complete": self.project().is_indexing_complete(),
+                });
+                if let Some(warning) = impl_result.warning {
+                    response["warning"] = serde_json::json!(warning);
+                }
+                if let Some(candidates) = impl_result.candidates {
+                    response["candidates"] = serde_json::json!(candidates);
+                }
+                serde_json::to_string_pretty(&response)
+                    .unwrap_or_else(|e| format!("Error: {}", e))
+            }
             Err(e) => format!("Error: {}", e),
         }
     }
@@ -420,7 +429,29 @@ impl CoderlmMcpServer {
     )]
     pub fn coderlm_symbols(&self, params: Parameters<SymbolsParams>) -> String {
         let p = &params.0;
-        let kind_filter = p.kind.as_deref().and_then(SymbolKind::from_str);
+
+        // Validate file exists in index
+        if let Some(ref file) = p.file {
+            if self.project().file_tree.get(file).is_none() {
+                return format!("Error: File '{}' not found in index", file);
+            }
+        }
+
+        // Validate kind parameter
+        let kind_filter = match p.kind.as_deref() {
+            Some(k) => match SymbolKind::from_str(k) {
+                Some(kind) => Some(kind),
+                None => {
+                    return format!(
+                        "Error: Invalid symbol kind '{}'. Valid kinds: function, method, class, struct, \
+                         enum, trait, interface, constant, variable, type, module, macro, import",
+                        k
+                    );
+                }
+            },
+            None => None,
+        };
+
         let limit = p.limit.unwrap_or(100);
         let results = symbol_ops::list_symbols(
             &self.project().symbol_table,
@@ -444,9 +475,11 @@ impl CoderlmMcpServer {
     )]
     pub fn coderlm_imports(&self, params: Parameters<ImportsParams>) -> String {
         let p = &params.0;
-        let result = imports::get_imports(&self.project().import_table, &p.file);
-        serde_json::to_string_pretty(&result)
-            .unwrap_or_else(|e| format!("Error: {}", e))
+        match imports::get_imports(&self.project().import_table, &p.file, Some(&self.project().file_tree)) {
+            Ok(result) => serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|e| format!("Error: {}", e)),
+            Err(e) => format!("Error: {}", e),
+        }
     }
 
     /// Finds files that depend on (import from) a given module or file path.
@@ -458,9 +491,11 @@ impl CoderlmMcpServer {
     )]
     pub fn coderlm_dependents(&self, params: Parameters<DependentsParams>) -> String {
         let p = &params.0;
-        let result = imports::get_dependents(&self.project().import_table, &p.file);
-        serde_json::to_string_pretty(&result)
-            .unwrap_or_else(|e| format!("Error: {}", e))
+        match imports::get_dependents(&self.project().import_table, &p.file) {
+            Ok(result) => serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|e| format!("Error: {}", e)),
+            Err(e) => format!("Error: {}", e),
+        }
     }
 
     /// Returns indexing stats: project root, file count, symbol count, and

@@ -446,7 +446,7 @@ fn extract_symbols_from_source(
             }
         }
 
-        if let (Some(name), Some(kind), Some(node)) = (name, kind, def_node) {
+        if let (Some(name), Some(mut kind), Some(node)) = (name, kind, def_node) {
             // For decorated_definition nodes, extract decorators from the outer
             // node but use the inner definition child for identity metadata
             // (byte_range, line_range, signature). This ensures the symbol's
@@ -487,17 +487,42 @@ fn extract_symbols_from_source(
                     }
                 }
                 if kind == SymbolKind::Function {
-                    // Walk ancestors to check if this function is inside a class.
-                    // If so, skip — it will be emitted as a Method by the class-body pattern.
+                    // Walk ancestors to check if this function is inside a class
+                    // (Python) or an impl block (Rust).
                     let mut ancestor = node.parent();
                     while let Some(anc) = ancestor {
                         if anc.kind() == "class_definition" {
                             break;
                         }
+                        if anc.kind() == "impl_item" {
+                            break;
+                        }
                         ancestor = anc.parent();
                     }
-                    if ancestor.is_some() {
-                        continue;
+                    if let Some(anc) = ancestor {
+                        if anc.kind() == "class_definition" {
+                            // Python: skip — it will be emitted as a Method by the class-body pattern.
+                            continue;
+                        }
+                        if anc.kind() == "impl_item" {
+                            // Rust: this function is inside an impl block.
+                            // Set kind to Method and extract the impl type as parent.
+                            kind = SymbolKind::Method;
+                            let mut impl_cursor = anc.walk();
+                            for child in anc.children(&mut impl_cursor) {
+                                // The type child of impl_item is typically a type_identifier
+                                // or a generic_type, scoped_type_identifier, etc.
+                                if child.kind() == "type_identifier"
+                                    || child.kind() == "generic_type"
+                                    || child.kind() == "scoped_type_identifier"
+                                {
+                                    if let Ok(type_text) = child.utf8_text(source.as_bytes()) {
+                                        parent = Some(type_text.to_string());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 (node, decorators)
@@ -2862,14 +2887,30 @@ from collections import OrderedDict
 use std::collections::HashMap;
 use anyhow::Result;
 use crate::index::file_entry::Language;
+use crate::config;
 "#;
         let imports = extract_imports_from_source(source, "test.rs", Language::Rust).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
         assert!(!imports.is_empty(), "Expected imports from Rust use declarations");
-        // Should capture the path prefix or top-level crate
+        // 3-segment: std::collections::HashMap -> captures path "std::collections"
         assert!(
             sources.iter().any(|s| s.contains("std")),
             "Expected 'std' in Rust imports, got: {:?}", sources
+        );
+        // 2-segment with crate keyword: use crate::config -> captures "crate::config"
+        assert!(
+            sources.contains(&"crate::config"),
+            "Expected 'crate::config' in Rust imports, got: {:?}", sources
+        );
+        // 2-segment with identifier: use anyhow::Result -> captures "anyhow::Result"
+        assert!(
+            sources.contains(&"anyhow::Result"),
+            "Expected 'anyhow::Result' in Rust imports, got: {:?}", sources
+        );
+        // 3-segment: use crate::index::file_entry::Language -> captures "crate::index::file_entry"
+        assert!(
+            sources.contains(&"crate::index::file_entry"),
+            "Expected 'crate::index::file_entry' in Rust imports, got: {:?}", sources
         );
     }
 

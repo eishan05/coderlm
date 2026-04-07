@@ -2,3 +2,8 @@ server/target/
 .claude/coderlm_state/
 *.pyc
 __pycache__/
+
+overnight-batch-*
+overnight-coder-state-*
+overnight-coder-parallel-*.json
+.worktrees

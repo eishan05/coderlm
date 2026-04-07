@@ -33,6 +33,11 @@ pub fn scan_directory(root: &Path, file_tree: &Arc<FileTree>, max_file_size: u64
             continue;
         }
 
+        // Skip symlinks to prevent indexing files outside the project root
+        if entry.path_is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
 
         // Get the relative path
@@ -276,5 +281,38 @@ mod tests {
             "File in ignored directory should not be indexed");
         assert!(file_tree.get("output.snap").is_none(),
             "File matching ignored glob should not be indexed");
+    }
+
+    #[test]
+    fn test_symlinks_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a normal file
+        std::fs::write(dir.path().join("real.rs"), "fn main() {}").unwrap();
+
+        // Create a symlink pointing to a file outside the project
+        // (we'll just point to the real file to test skipping; the key
+        //  is that the entry IS a symlink)
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                dir.path().join("real.rs"),
+                dir.path().join("link.rs"),
+            )
+            .unwrap();
+        }
+
+        let file_tree = Arc::new(FileTree::new());
+        scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        assert!(
+            file_tree.get("real.rs").is_some(),
+            "Regular file should be indexed"
+        );
+
+        #[cfg(unix)]
+        assert!(
+            file_tree.get("link.rs").is_none(),
+            "Symlink should NOT be indexed"
+        );
     }
 }

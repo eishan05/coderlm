@@ -171,7 +171,8 @@ impl Session {
             method: method.to_string(),
             path: path.to_string(),
             response_preview: if response_preview.len() > 200 {
-                format!("{}...", &response_preview[..200])
+                let truncate_at = response_preview.floor_char_boundary(200);
+                format!("{}...", &response_preview[..truncate_at])
             } else {
                 response_preview.to_string()
             },

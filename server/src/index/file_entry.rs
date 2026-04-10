@@ -66,6 +66,26 @@ impl Language {
             | Language::Java | Language::Scala
         )
     }
+
+    /// Whether this is a programming language (as opposed to data/config/markup).
+    /// Used to restrict caller detection to files that can actually contain code.
+    pub fn is_code(&self) -> bool {
+        matches!(
+            self,
+            Language::Rust
+                | Language::Python
+                | Language::TypeScript
+                | Language::JavaScript
+                | Language::Go
+                | Language::Java
+                | Language::Scala
+                | Language::C
+                | Language::Cpp
+                | Language::Ruby
+                | Language::Shell
+                | Language::Sql
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

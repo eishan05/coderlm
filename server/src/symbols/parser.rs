@@ -326,6 +326,11 @@ fn extract_symbols_from_source(
                 "function.def" => {
                     def_node = Some(cap.node);
                 }
+                // `method.name` / `method.def` are still emitted by the
+                // TypeScript/JavaScript queries (which use class-body
+                // member patterns). Python no longer captures them — its
+                // methods are detected by the post-identity ancestor walk
+                // below. Other languages may still rely on them.
                 "method.name" => {
                     name = Some(text.to_string());
                     kind = Some(SymbolKind::Method);
@@ -472,13 +477,10 @@ fn extract_symbols_from_source(
                 }
                 (inner_node, decs)
             } else {
-                // Skip bare function_definition/class_definition nodes that
-                // are already handled by more specific query patterns:
-                // 1. Direct children of decorated_definition — those are
-                //    handled by the decorated_definition patterns.
-                // 2. Functions resolved as SymbolKind::Function that live
-                //    inside a class_definition — those are methods, handled
-                //    by the class-body method patterns.
+                // Skip bare function_definition/class_definition nodes whose
+                // parent is a decorated_definition — those are emitted by the
+                // decorated_definition patterns and would otherwise produce
+                // duplicate symbols for the same identity.
                 if matches!(kind, SymbolKind::Function | SymbolKind::Class) {
                     if let Some(parent_node) = node.parent() {
                         if parent_node.kind() == "decorated_definition" {
@@ -487,26 +489,13 @@ fn extract_symbols_from_source(
                     }
                 }
                 if kind == SymbolKind::Function {
-                    // Walk ancestors to check if this function is inside a class
-                    // (Python) or an impl block (Rust).
+                    // Rust: a bare function inside an impl block is a method
+                    // on that type. Walk ancestors to detect this. We stop
+                    // at any nested function/lambda boundary so an inner
+                    // function isn't mis-attributed to a containing impl.
                     let mut ancestor = node.parent();
                     while let Some(anc) = ancestor {
-                        if anc.kind() == "class_definition" {
-                            break;
-                        }
                         if anc.kind() == "impl_item" {
-                            break;
-                        }
-                        ancestor = anc.parent();
-                    }
-                    if let Some(anc) = ancestor {
-                        if anc.kind() == "class_definition" {
-                            // Python: skip — it will be emitted as a Method by the class-body pattern.
-                            continue;
-                        }
-                        if anc.kind() == "impl_item" {
-                            // Rust: this function is inside an impl block.
-                            // Set kind to Method and extract the impl type as parent.
                             kind = SymbolKind::Method;
                             let mut impl_cursor = anc.walk();
                             for child in anc.children(&mut impl_cursor) {
@@ -522,11 +511,64 @@ fn extract_symbols_from_source(
                                     break;
                                 }
                             }
+                            break;
                         }
+                        // Stop at function/closure boundaries — don't attribute
+                        // a nested function to an impl block that contains its
+                        // enclosing function.
+                        if anc.kind() == "function_item"
+                            || anc.kind() == "function_definition"
+                            || anc.kind() == "closure_expression"
+                        {
+                            break;
+                        }
+                        ancestor = anc.parent();
                     }
                 }
                 (node, decorators)
             };
+
+            // Python: classify functions as methods based on lexical scope.
+            //
+            // Earlier query versions tried to do this via dedicated
+            // `(class_definition body: (block (function_definition ...)?))`
+            // patterns that captured `@method.name`. Those patterns nested
+            // an *optional* method capture inside the class match, which
+            // tree-sitter fired once per matching method — every match then
+            // contained both `@class.name` AND `@method.name` and the
+            // single-symbol-per-match loop overwrote class with method,
+            // silently dropping the class symbol whenever the class had
+            // any decorated method. The current query emits classes and
+            // functions as independent matches; this walk decides whether
+            // each function is a free function or a method by walking up
+            // from the function's identity node to the nearest enclosing
+            // function-or-class boundary.
+            if language == Language::Python
+                && (kind == SymbolKind::Function || kind == SymbolKind::Method)
+            {
+                let mut anc = identity_node.parent();
+                while let Some(n) = anc {
+                    if n.kind() == "class_definition" {
+                        if let Some(name_node) = n.child_by_field_name("name") {
+                            if let Ok(cls_name) = name_node.utf8_text(source.as_bytes()) {
+                                parent = Some(cls_name.to_string());
+                            }
+                        }
+                        kind = SymbolKind::Method;
+                        break;
+                    }
+                    // Stop at any enclosing function / lambda — a nested
+                    // `def` inside a method is still a free function, not a
+                    // method of the outer class. The `module` boundary is
+                    // implicit (we just walk past `block` siblings until
+                    // we hit `class_definition`, `function_definition`, or
+                    // `lambda`).
+                    if n.kind() == "function_definition" || n.kind() == "lambda" {
+                        break;
+                    }
+                    anc = n.parent();
+                }
+            }
 
             let start = identity_node.start_position();
             let end = identity_node.end_position();
@@ -1426,6 +1468,286 @@ def users():
             users_fn.decorators[0].contains("@app.route"),
             "Expected @app.route decorator on 'users', got: {:?}",
             users_fn.decorators
+        );
+    }
+
+    #[test]
+    fn test_python_class_with_decorated_methods_emits_class_symbol() {
+        // Regression for the xanbot benchmark bug: Python classes that
+        // contain `@property` (or any decorated) methods used to be
+        // dropped from the symbol table entirely because the SYMBOLS_QUERY
+        // nested an optional method capture inside the class pattern,
+        // which fired once per matching method. Every "class match" then
+        // contained a method capture that overwrote the class one in the
+        // parser's per-match loop, so no Class symbol was emitted.
+        //
+        // The fix is two-part: (1) the Python query now emits classes as
+        // independent matches (no nested method captures), and (2) the
+        // parser classifies functions as methods via an ancestor walk
+        // instead of relying on dedicated method captures.
+        let source = r#"
+class DryRunBroker:
+    """A broker."""
+
+    def __init__(self):
+        self._orders = []
+
+    def place_order(self, ticker):
+        return len(self._orders)
+
+    @property
+    def order_count(self) -> int:
+        return len(self._orders)
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        // Exactly one Class symbol must be emitted for DryRunBroker.
+        let classes: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(
+            classes.len(),
+            1,
+            "Expected exactly 1 Class symbol, got {:?}",
+            classes.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert_eq!(classes[0].name, "DryRunBroker");
+
+        // All three methods must be present, each with parent=DryRunBroker.
+        let methods: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(
+            methods.len(),
+            3,
+            "Expected 3 methods, got {:?}",
+            methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        for m in &methods {
+            assert_eq!(
+                m.parent.as_deref(),
+                Some("DryRunBroker"),
+                "Method {} should have parent=DryRunBroker, got {:?}",
+                m.name,
+                m.parent
+            );
+        }
+
+        // The decorated method must NOT also appear as a free Function —
+        // earlier versions emitted a duplicate `Function` symbol for
+        // `@property def order_count(...)` because the decorator branch
+        // never reclassified it as a method.
+        let order_count_functions: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.name == "order_count" && s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            order_count_functions.is_empty(),
+            "Decorated method 'order_count' must not also be emitted as Function: {:?}",
+            order_count_functions
+        );
+    }
+
+    #[test]
+    fn test_python_real_shaped_broker_class() {
+        // Regression modeled after the real xanbot dry_run.py shape:
+        // module docstring, imports, module logger, then a class with a
+        // docstring, multi-line `__init__`, several multi-line methods
+        // with type annotations, and `@property`-decorated accessors.
+        // Before the fix, this exact shape produced 0 Class symbols.
+        let source = r#""""DryRunBroker — paper-trading broker."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class DryRunBroker:
+    """In-memory broker that mirrors the LiveBroker public interface."""
+
+    def __init__(
+        self,
+        initial_collateral: float = 0.0,
+    ) -> None:
+        self._orders: dict[str, dict[str, Any]] = {}
+        self._collateral = initial_collateral
+
+    def place_order(
+        self,
+        token_id: str,
+        side: str,
+        size: float,
+        price: float,
+    ) -> str:
+        return "fake-id"
+
+    def cancel_orders(self, order_ids: list[str]) -> None:
+        for oid in order_ids:
+            self._orders.pop(oid, None)
+
+    @property
+    def order_count(self) -> int:
+        """Number of currently tracked orders."""
+        return len(self._orders)
+
+    @property
+    def orders(self) -> dict[str, dict[str, Any]]:
+        return self._orders
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        // Class symbol must be present.
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "DryRunBroker"),
+            "Expected Class symbol DryRunBroker for real-shaped broker fixture"
+        );
+
+        // Every method must have parent=DryRunBroker (no leaked free
+        // functions from decorated methods).
+        let expected_methods = [
+            "__init__",
+            "place_order",
+            "cancel_orders",
+            "order_count",
+            "orders",
+        ];
+        for name in &expected_methods {
+            let m = symbols
+                .iter()
+                .find(|s| s.kind == SymbolKind::Method && s.name == *name)
+                .unwrap_or_else(|| {
+                    panic!("Expected method '{}' for real-shaped broker", name)
+                });
+            assert_eq!(
+                m.parent.as_deref(),
+                Some("DryRunBroker"),
+                "Method '{}' should have parent=DryRunBroker, got {:?}",
+                name,
+                m.parent
+            );
+            // Decorated methods should not also exist as Function.
+            assert!(
+                !symbols
+                    .iter()
+                    .any(|s| s.name == *name && s.kind == SymbolKind::Function),
+                "Method '{}' must not also be emitted as a free Function",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_method_parent_is_class_name() {
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+    def g(self, x):
+        return x
+
+class B:
+    def f(self):
+        pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let methods: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(
+            methods.len(),
+            3,
+            "Expected 3 Python methods, got {}: {:?}",
+            methods.len(),
+            methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+
+        let a_f = methods
+            .iter()
+            .find(|m| m.name == "f" && m.parent.as_deref() == Some("A"))
+            .expect("Expected method f with parent=A");
+        assert_eq!(a_f.parent.as_deref(), Some("A"));
+
+        let b_f = methods
+            .iter()
+            .find(|m| m.name == "f" && m.parent.as_deref() == Some("B"))
+            .expect("Expected method f with parent=B");
+        assert_eq!(b_f.parent.as_deref(), Some("B"));
+
+        let a_g = methods
+            .iter()
+            .find(|m| m.name == "g")
+            .expect("Expected method g");
+        assert_eq!(a_g.parent.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn test_python_decorated_method_has_parent() {
+        let source = r#"
+class Widget:
+    @property
+    def name(self):
+        return self._name
+
+    @staticmethod
+    def create():
+        return Widget()
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let name_method = symbols
+            .iter()
+            .find(|s| s.name == "name" && s.kind == SymbolKind::Method)
+            .expect("Expected decorated method 'name'");
+        assert_eq!(
+            name_method.parent.as_deref(),
+            Some("Widget"),
+            "Decorated Python method should still resolve its parent class"
+        );
+
+        let create_method = symbols
+            .iter()
+            .find(|s| s.name == "create" && s.kind == SymbolKind::Method)
+            .expect("Expected decorated method 'create'");
+        assert_eq!(create_method.parent.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn test_python_nested_class_method_parent_is_innermost() {
+        let source = r#"
+class Outer:
+    def outer_method(self):
+        pass
+
+    class Inner:
+        def inner_method(self):
+            pass
+"#;
+        let symbols = extract_from_source(source, Language::Python);
+
+        let outer = symbols
+            .iter()
+            .find(|s| s.name == "outer_method")
+            .expect("Expected outer_method");
+        assert_eq!(outer.parent.as_deref(), Some("Outer"));
+
+        let inner = symbols
+            .iter()
+            .find(|s| s.name == "inner_method")
+            .expect("Expected inner_method");
+        assert_eq!(
+            inner.parent.as_deref(),
+            Some("Inner"),
+            "Nested class method parent should be the innermost class"
         );
     }
 

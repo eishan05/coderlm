@@ -167,10 +167,26 @@ pub fn find_callers(
     limit: usize,
     line: Option<usize>,
 ) -> Result<Vec<CallerInfo>, String> {
-    // Verify symbol exists
-    let _sym = symbol_table
+    // Verify symbol exists and capture its identity (kind, language, parent
+    // class) so caller scanning can scope matches to the right definition
+    // rather than just matching by name.
+    let mut target = symbol_table
         .get(file, symbol_name, line)
         .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
+
+    // If the caller did not provide a line hint and the file has multiple
+    // same-named symbols, `get()` silently picks the first one by line
+    // order. Running definition-aware receiver resolution against that
+    // arbitrary target would then drop callers belonging to the *other*
+    // same-named definitions — a silent regression vs the old name-only
+    // behavior. Detect this ambiguity and fall back to name-only matching
+    // by clearing `parent` on the working target copy.
+    if line.is_none() {
+        let same_named = symbol_table.find_by_file_and_name(file, symbol_name);
+        if same_named.len() > 1 {
+            target.parent = None;
+        }
+    }
 
     if limit == 0 {
         return Ok(Vec::new());
@@ -182,9 +198,9 @@ pub fn find_callers(
         let rel_path = entry.key().clone();
         let language = entry.value().language;
 
-        // Skip documentation files from regex fallback — they produce
-        // false positives (prose mentions, code examples in markdown).
-        if !language.has_tree_sitter_support() && is_documentation_file(&rel_path) {
+        // Only search code files — data/config/markup files (JSON, YAML,
+        // TOML, HTML, CSS, Markdown, etc.) produce false-positive callers.
+        if !language.is_code() {
             continue;
         }
 
@@ -196,7 +212,7 @@ pub fn find_callers(
         };
 
         let file_callers = if language.has_tree_sitter_support() {
-            find_callers_ast(&source, &rel_path, language, symbol_name, file)
+            find_callers_ast(&source, &rel_path, language, &target, symbol_table)
         } else {
             find_callers_regex(&source, &rel_path, symbol_name, file)
         };
@@ -212,15 +228,371 @@ pub fn find_callers(
     Ok(callers)
 }
 
+/// Classification of a single method call site relative to a target method.
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiverResolution {
+    /// The receiver was resolved to the target's parent class.
+    Exact,
+    /// The receiver was resolved to a *different* unambiguously-known class
+    /// — drop.
+    NoMatch,
+    /// The receiver could not be resolved to any specific class. Keep the
+    /// match but flag it so the agent knows this is a best-effort result.
+    Ambiguous(String),
+}
+
+/// Result of classifying a bare identifier name against the project's
+/// symbol table for the purpose of "is this a class constructor?".
+#[derive(Debug, PartialEq, Eq)]
+enum NameClassification {
+    /// Exactly one class symbol with this name, and no non-class symbol
+    /// shares it. Safe to treat `Name(...)` as a constructor.
+    UniqueClass,
+    /// Either multiple classes share this name, or a class and a
+    /// function/variable share it. `Name(...)` could be any of them, so we
+    /// refuse to drop the call site.
+    Ambiguous,
+    /// No class symbol with this name (e.g. a factory function, local
+    /// variable, or something we haven't indexed).
+    NotAClass,
+}
+
+/// Classify a bare identifier against the project's symbol table.
+fn classify_name(symbol_table: &SymbolTable, name: &str) -> NameClassification {
+    let Some(keys) = symbol_table.by_name.get(name) else {
+        return NameClassification::NotAClass;
+    };
+
+    let mut class_count = 0usize;
+    let mut has_non_class = false;
+    for key in keys.iter() {
+        if let Some(sym) = symbol_table.symbols.get(key) {
+            let kind = sym.value().kind;
+            if matches!(
+                kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface
+            ) {
+                class_count += 1;
+            } else {
+                has_non_class = true;
+            }
+        }
+    }
+
+    if class_count == 0 {
+        NameClassification::NotAClass
+    } else if class_count == 1 && !has_non_class {
+        NameClassification::UniqueClass
+    } else {
+        // Multiple classes with the same name, or a class plus a
+        // function/variable of the same name — can't attribute `Name(...)`
+        // to a single definition from the AST alone.
+        NameClassification::Ambiguous
+    }
+}
+
+/// Resolve a Python call-site receiver to a class name (if possible) and
+/// classify the call against a target method's parent class.
+///
+/// This implements the subset of Python receiver analysis that is visible at
+/// the AST level without type inference:
+///
+/// 1. `ClassName(...).method()` — the receiver is a direct constructor call.
+///    Exact match iff `ClassName == target_parent`, no-match iff it is an
+///    unambiguously different known class, ambiguous if the identifier is
+///    not uniquely a class.
+/// 2. `x = ClassName(...); x.method()` — a local variable whose *latest*
+///    binding prior to the call is a constructor call. The walk respects
+///    the enclosing function's lexical scope and does not descend into
+///    nested `def` / `lambda` / comprehensions. Reassignments are tracked
+///    so `x = A(); x = make_b(); x.f()` correctly becomes ambiguous.
+/// 3. `self`, `cls`, `self.attr`, unknown identifiers, factory calls, or
+///    other expressions — classified as `Ambiguous` with a short reason.
+///    Callers are returned so that true positives are not silently dropped.
+///
+/// `symbol_table` is consulted to decide whether an identifier used as a
+/// constructor is a unique class in the project — this is what lets us
+/// treat `A()` differently from `make_foo()`, and also lets us fall back
+/// to ambiguous when a name is shadowed.
+fn resolve_python_receiver(
+    receiver_node: tree_sitter::Node,
+    callee_node: tree_sitter::Node,
+    source: &str,
+    target_parent: &str,
+    symbol_table: &SymbolTable,
+) -> ReceiverResolution {
+    // Case 1: receiver is a direct call like `ClassName(...)`.
+    if receiver_node.kind() == "call" {
+        if let Some(fn_node) = receiver_node.child_by_field_name("function") {
+            if fn_node.kind() == "identifier" {
+                let ident = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
+                return match classify_name(symbol_table, ident) {
+                    NameClassification::UniqueClass => {
+                        if ident == target_parent {
+                            ReceiverResolution::Exact
+                        } else {
+                            ReceiverResolution::NoMatch
+                        }
+                    }
+                    NameClassification::Ambiguous => ReceiverResolution::Ambiguous(format!(
+                        "receiver constructor '{}' is ambiguous (multiple classes or \
+                         class/non-class name collision)",
+                        ident
+                    )),
+                    NameClassification::NotAClass => ReceiverResolution::Ambiguous(format!(
+                        "receiver is a call to '{}' which is not a known class",
+                        ident
+                    )),
+                };
+            }
+        }
+        return ReceiverResolution::Ambiguous(
+            "receiver is a call expression with an unresolved callable".to_string(),
+        );
+    }
+
+    // Case 2: receiver is a bare identifier like `x`.
+    if receiver_node.kind() == "identifier" {
+        let ident = receiver_node.utf8_text(source.as_bytes()).unwrap_or("");
+        if ident == "self" || ident == "cls" {
+            return ReceiverResolution::Ambiguous(
+                "receiver is self/cls; class-attribute tracking is not implemented".to_string(),
+            );
+        }
+        // Find the latest binding of `ident` in the enclosing function
+        // body, occurring lexically before the call site.
+        match find_local_binding(callee_node, ident, source, symbol_table) {
+            Some(LocalBinding::UniqueClass(class_name)) => {
+                if class_name == target_parent {
+                    ReceiverResolution::Exact
+                } else {
+                    ReceiverResolution::NoMatch
+                }
+            }
+            Some(LocalBinding::AmbiguousClass(class_name)) => ReceiverResolution::Ambiguous(
+                format!(
+                    "local '{}' was assigned from '{}' but that name is ambiguous \
+                     (multiple classes or class/non-class name collision)",
+                    ident, class_name
+                ),
+            ),
+            Some(LocalBinding::Other) => ReceiverResolution::Ambiguous(format!(
+                "local '{}' was reassigned from a non-constructor expression before \
+                 this call",
+                ident
+            )),
+            None => ReceiverResolution::Ambiguous(format!(
+                "receiver '{}' has no visible local assignment to a known class",
+                ident
+            )),
+        }
+    } else if receiver_node.kind() == "attribute" {
+        // Case 3: attribute access like `self.attr`, `self.broker.method`.
+        ReceiverResolution::Ambiguous(
+            "receiver is an attribute access; requires data-flow analysis".to_string(),
+        )
+    } else {
+        // Anything else (subscript, parenthesized expression, etc.) — ambiguous.
+        ReceiverResolution::Ambiguous(format!(
+            "receiver kind '{}' is not handled",
+            receiver_node.kind()
+        ))
+    }
+}
+
+/// Possible outcomes of looking up the latest local binding of an
+/// identifier before a call site.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalBinding {
+    /// Latest binding is a constructor call to an unambiguously-unique class.
+    UniqueClass(String),
+    /// Latest binding is a constructor call, but the class name is
+    /// ambiguous (multiple classes or class/non-class name collision).
+    AmbiguousClass(String),
+    /// Latest binding is not a constructor call (factory, variable,
+    /// literal, etc.) — classification unknown.
+    Other,
+}
+
+/// Walk up from `from_node` until we find the enclosing `function_definition`
+/// or `lambda`. Returns that function node, or `None` if the call is at
+/// module scope.
+fn enclosing_function_node(from_node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cur = from_node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "function_definition" || n.kind() == "lambda" {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Find the latest local binding of `ident` in the enclosing function of
+/// `call_node`, occurring strictly before `call_node`. Respects lexical
+/// scope: does not descend into nested functions, classes, lambdas, or
+/// comprehensions.
+fn find_local_binding(
+    call_node: tree_sitter::Node,
+    ident: &str,
+    source: &str,
+    symbol_table: &SymbolTable,
+) -> Option<LocalBinding> {
+    // Scope the search to the enclosing function body. If the call is at
+    // module scope, fall back to scanning the module root.
+    let scope_root = enclosing_function_node(call_node)
+        .and_then(|f| f.child_by_field_name("body"))
+        .or_else(|| {
+            let mut cur = call_node.parent();
+            while let Some(n) = cur {
+                if n.kind() == "module" {
+                    return Some(n);
+                }
+                cur = n.parent();
+            }
+            None
+        })?;
+
+    let call_start = call_node.start_byte();
+    // Track the assignment with the largest start_byte (lexically latest)
+    // that binds `ident` and is fully before the call site.
+    let mut latest: Option<(usize, LocalBinding)> = None;
+    walk_assignments(
+        scope_root,
+        /*is_scope_root=*/ true,
+        ident,
+        call_start,
+        source,
+        symbol_table,
+        &mut latest,
+    );
+    latest.map(|(_, binding)| binding)
+}
+
+/// Recursively walk `node`'s descendants looking for assignments that bind
+/// `ident`, occurring fully before `cutoff_byte`. Updates `latest` with the
+/// lexically latest such assignment.
+///
+/// Lexical-scope safety: when we descend into a subtree that introduces a
+/// new Python scope (nested function, lambda, class body, comprehension),
+/// we stop — assignments there bind a *different* `ident` in a different
+/// scope and must not affect the caller's scope. The scope-root node itself
+/// is always allowed (the function body we started at).
+fn walk_assignments(
+    node: tree_sitter::Node,
+    is_scope_root: bool,
+    ident: &str,
+    cutoff_byte: usize,
+    source: &str,
+    symbol_table: &SymbolTable,
+    latest: &mut Option<(usize, LocalBinding)>,
+) {
+    // Skip nested scopes entirely — they introduce their own binding of
+    // `ident` which must not leak out into the enclosing function.
+    if !is_scope_root
+        && matches!(
+            node.kind(),
+            "function_definition"
+                | "class_definition"
+                | "lambda"
+                | "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+        )
+    {
+        return;
+    }
+
+    // If the entire subtree starts at or after the call, nothing in it can
+    // precede the call.
+    if node.start_byte() >= cutoff_byte {
+        return;
+    }
+
+    if node.kind() == "assignment" {
+        // Only count assignments that have *completed* before the call.
+        // `x = A(x.f())` has an assignment that starts before the callee
+        // but has not finished when the callee runs — it must not be
+        // treated as a prior binding.
+        if node.end_byte() <= cutoff_byte {
+            let left = node.child_by_field_name("left");
+            let right = node.child_by_field_name("right");
+            if let (Some(left), Some(right)) = (left, right) {
+                let matches_ident = left.kind() == "identifier"
+                    && left.utf8_text(source.as_bytes()).unwrap_or("") == ident;
+                if matches_ident {
+                    let binding = classify_assignment_rhs(right, source, symbol_table);
+                    let start = node.start_byte();
+                    match latest.as_ref() {
+                        Some((prev_start, _)) if *prev_start >= start => {}
+                        _ => {
+                            *latest = Some((start, binding));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into children. We still recurse even when the current node
+    // is an assignment whose end_byte > cutoff, because inner statements
+    // might legitimately contain completed prior assignments (e.g. within
+    // an inner list comprehension's generator, though those would be
+    // blocked by the scope check above anyway).
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_assignments(
+            child,
+            /*is_scope_root=*/ false,
+            ident,
+            cutoff_byte,
+            source,
+            symbol_table,
+            latest,
+        );
+    }
+}
+
+/// Classify the right-hand side of an assignment: is it a known-class
+/// constructor call, an ambiguous constructor-like call, or something else?
+fn classify_assignment_rhs(
+    rhs: tree_sitter::Node,
+    source: &str,
+    symbol_table: &SymbolTable,
+) -> LocalBinding {
+    if rhs.kind() == "call" {
+        if let Some(fn_node) = rhs.child_by_field_name("function") {
+            if fn_node.kind() == "identifier" {
+                let cls = fn_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                return match classify_name(symbol_table, &cls) {
+                    NameClassification::UniqueClass => LocalBinding::UniqueClass(cls),
+                    NameClassification::Ambiguous => LocalBinding::AmbiguousClass(cls),
+                    NameClassification::NotAClass => LocalBinding::Other,
+                };
+            }
+        }
+    }
+    LocalBinding::Other
+}
+
 /// AST-aware caller detection: parse the file, run the callers query,
 /// and check if any call-expression callee matches the target symbol name.
+///
+/// For Python methods with a resolved parent class, receivers are analyzed
+/// and the match is classified (exact / ambiguous / no-match). For other
+/// languages, parentless Python targets, or Python free functions the old
+/// name-only behavior is preserved.
 fn find_callers_ast(
     source: &str,
     rel_path: &str,
     language: Language,
-    symbol_name: &str,
-    definition_file: &str,
+    target: &Symbol,
+    symbol_table: &SymbolTable,
 ) -> Vec<CallerInfo> {
+    let symbol_name = target.name.as_str();
+    let definition_file = target.file.as_str();
+
     let config = match queries::get_language_config(language) {
         Some(c) => c,
         None => return find_callers_regex(source, rel_path, symbol_name, definition_file),
@@ -243,40 +615,102 @@ fn find_callers_ast(
 
     let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
     let callee_idx = capture_names.iter().position(|n| n == "callee");
+    let receiver_idx = capture_names.iter().position(|n| n == "receiver");
+
+    // Enable definition-aware resolution only when the target is a Python
+    // method with a known parent class.
+    let python_method_target = target.language == Language::Python
+        && target.kind == SymbolKind::Method
+        && target.parent.is_some();
 
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
     let mut callers = Vec::new();
 
     while let Some(m) = matches.next() {
+        // Find the callee capture in this match, and the receiver capture
+        // if present.
+        let mut callee_cap: Option<&tree_sitter::QueryCapture> = None;
+        let mut receiver_cap: Option<&tree_sitter::QueryCapture> = None;
         for cap in m.captures {
             if Some(cap.index as usize) == callee_idx {
-                let text = cap.node.utf8_text(source.as_bytes()).unwrap_or("");
-                if text == symbol_name {
-                    let line_num = cap.node.start_position().row + 1;
-                    // Skip the definition itself
-                    if rel_path == definition_file {
-                        let line_text = source
-                            .lines()
-                            .nth(line_num - 1)
-                            .unwrap_or("");
-                        if is_definition_line(line_text, symbol_name, language) {
-                            continue;
-                        }
-                    }
-                    let line_text = source
-                        .lines()
-                        .nth(line_num - 1)
-                        .map(|l| l.trim().to_string())
-                        .unwrap_or_default();
-                    callers.push(CallerInfo {
-                        file: rel_path.to_string(),
-                        line: line_num,
-                        text: line_text,
-                    });
-                }
+                callee_cap = Some(cap);
+            } else if Some(cap.index as usize) == receiver_idx {
+                receiver_cap = Some(cap);
             }
         }
+
+        let cap = match callee_cap {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let text = cap.node.utf8_text(source.as_bytes()).unwrap_or("");
+        if text != symbol_name {
+            continue;
+        }
+
+        let line_num = cap.node.start_position().row + 1;
+
+        // Skip the definition itself (the `def foo` line still contains the
+        // identifier `foo`, which can otherwise be captured as a callee).
+        if rel_path == definition_file {
+            let line_text = source.lines().nth(line_num - 1).unwrap_or("");
+            if is_definition_line(line_text, symbol_name, language) {
+                continue;
+            }
+        }
+
+        let line_text = source
+            .lines()
+            .nth(line_num - 1)
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default();
+
+        // Decide what resolution metadata, if any, to attach.
+        let (resolution, reason) = if python_method_target {
+            let target_parent = target.parent.as_deref().unwrap_or("");
+            match receiver_cap {
+                Some(rcap) => {
+                    match resolve_python_receiver(
+                        rcap.node,
+                        cap.node,
+                        source,
+                        target_parent,
+                        symbol_table,
+                    ) {
+                        ReceiverResolution::Exact => (Some("exact".to_string()), None),
+                        ReceiverResolution::NoMatch => continue,
+                        ReceiverResolution::Ambiguous(reason) => {
+                            (Some("ambiguous".to_string()), Some(reason))
+                        }
+                    }
+                }
+                None => {
+                    // A method call should almost always have a receiver. The
+                    // only way to reach this branch is a bare `symbol_name()`
+                    // call matching the identifier-only pattern. Treat it as
+                    // ambiguous rather than silently including it as exact.
+                    (
+                        Some("ambiguous".to_string()),
+                        Some(
+                            "bare call has no receiver — cannot tie to any class"
+                                .to_string(),
+                        ),
+                    )
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        callers.push(CallerInfo {
+            file: rel_path.to_string(),
+            line: line_num,
+            text: line_text,
+            resolution,
+            reason,
+        });
     }
 
     callers
@@ -311,6 +745,8 @@ fn find_callers_regex(
                 file: rel_path.to_string(),
                 line: line_num + 1,
                 text: line.trim().to_string(),
+                resolution: None,
+                reason: None,
             });
         }
     }
@@ -375,22 +811,28 @@ fn is_definition_line(line: &str, name: &str, language: Language) -> bool {
     }
 }
 
-/// Check if a file path refers to a documentation file (Markdown, text, etc.)
-/// that should be excluded from regex-based caller detection.
-fn is_documentation_file(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.ends_with(".md")
-        || lower.ends_with(".txt")
-        || lower.ends_with(".rst")
-        || lower.ends_with(".adoc")
-        || lower.ends_with(".rdoc")
-}
-
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CallerInfo {
     pub file: String,
     pub line: usize,
     pub text: String,
+    /// Caller-resolution classification. Currently only populated for Python
+    /// method callers where the receiver expression can (or cannot) be tied
+    /// back to the target method's containing class.
+    ///
+    /// - `"exact"`: the receiver was resolved to the target's parent class.
+    /// - `"ambiguous"`: the receiver could not be resolved (e.g. `self.attr`,
+    ///   an unknown variable, or a factory call), but the call *might* target
+    ///   this method. Returned so callers are not silently dropped.
+    ///
+    /// `None` means resolution is not applicable (non-Python, free function,
+    /// or the target symbol has no recorded parent class).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Short human-readable explanation of why the resolution was ambiguous.
+    /// `None` for exact matches and when resolution is not applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Find test functions that reference a given symbol.
@@ -1662,5 +2104,929 @@ EOF
         assert!(!is_definition_line_regex("result = foo(1, 2)", "foo"));
         assert!(!is_definition_line_regex("let x = foo();", "foo"));
         assert!(!is_definition_line_regex("print(foo(bar))", "foo"));
+    }
+
+    // ── Python method caller resolution (end-to-end) ──────────────────────
+    //
+    // These tests index a small temp project on disk, then exercise
+    // `find_callers` through the same path used by the HTTP API. This
+    // verifies that:
+    // - Python methods are indexed with a `parent` class.
+    // - `find_callers` uses the resolved symbol's identity (file + line) to
+    //   distinguish same-named methods on different classes.
+    // - Receiver-based resolution correctly includes/excludes call sites.
+    // - Ambiguous receivers are surfaced with a `resolution: "ambiguous"`
+    //   flag instead of being silently presented as exact matches.
+
+    use crate::index::file_tree::FileTree;
+    use crate::symbols::parser;
+    use crate::symbols::SymbolTable;
+    use tempfile::TempDir;
+
+    /// Index a temp directory containing Python files and return the
+    /// root path, file tree, and symbol table ready for `find_callers`.
+    fn index_python_project(files: &[(&str, &str)]) -> (TempDir, Arc<FileTree>, Arc<SymbolTable>) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            let file_path = dir.path().join(name);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&file_path, content).unwrap();
+        }
+
+        let file_tree = Arc::new(FileTree::new());
+        crate::index::walker::scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
+
+        let symbol_table = Arc::new(SymbolTable::new());
+        let paths: Vec<(String, Language)> = file_tree
+            .files
+            .iter()
+            .filter(|e| e.value().language.has_tree_sitter_support())
+            .map(|e| (e.key().clone(), e.value().language))
+            .collect();
+        for (rel_path, language) in paths {
+            if let Ok(symbols) = parser::extract_symbols_from_file(dir.path(), &rel_path, language)
+            {
+                for sym in symbols {
+                    symbol_table.insert(sym);
+                }
+            }
+        }
+
+        (dir, file_tree, symbol_table)
+    }
+
+    /// Helper: find a Python method by name + parent class name so tests
+    /// can unambiguously reference `A.f` vs `B.f`.
+    fn find_method(
+        symbol_table: &SymbolTable,
+        file: &str,
+        name: &str,
+        parent: &str,
+    ) -> Symbol {
+        symbol_table
+            .find_by_file_and_name(file, name)
+            .into_iter()
+            .find(|s| s.parent.as_deref() == Some(parent))
+            .unwrap_or_else(|| panic!("Method {}.{} not found in {}", parent, name, file))
+    }
+
+    #[test]
+    fn test_find_callers_distinguishes_a_f_and_b_f() {
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+class B:
+    def f(self):
+        pass
+
+A().f()
+B().f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let b_f = find_method(&symbol_table, "main.py", "f", "B");
+
+        // Callers of A.f should only include A().f(), not B().f().
+        let a_callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+        assert_eq!(
+            a_callers.len(),
+            1,
+            "Expected 1 caller of A.f, got {:?}",
+            a_callers
+        );
+        assert!(
+            a_callers[0].text.contains("A().f()"),
+            "Expected A().f() call site, got '{}'",
+            a_callers[0].text
+        );
+        assert_eq!(
+            a_callers[0].resolution.as_deref(),
+            Some("exact"),
+            "A().f() should be an exact match"
+        );
+
+        // Callers of B.f should only include B().f().
+        let b_callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &b_f.name,
+            &b_f.file,
+            50,
+            Some(b_f.line_range.0),
+        )
+        .unwrap();
+        assert_eq!(
+            b_callers.len(),
+            1,
+            "Expected 1 caller of B.f, got {:?}",
+            b_callers
+        );
+        assert!(
+            b_callers[0].text.contains("B().f()"),
+            "Expected B().f() call site, got '{}'",
+            b_callers[0].text
+        );
+        assert_eq!(b_callers[0].resolution.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn test_find_callers_resolves_local_variable_constructor() {
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+class B:
+    def f(self):
+        pass
+
+def use_a():
+    a = A()
+    a.f()
+
+def use_b():
+    b = B()
+    b.f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+
+        // Only `a.f()` from use_a should match; `b.f()` in use_b must be
+        // resolved to B and dropped.
+        let exact: Vec<&CallerInfo> = callers
+            .iter()
+            .filter(|c| c.resolution.as_deref() == Some("exact"))
+            .collect();
+        assert_eq!(
+            exact.len(),
+            1,
+            "Expected 1 exact caller for A.f, got {:?}",
+            callers
+        );
+        assert!(
+            exact[0].text.contains("a.f()"),
+            "Expected 'a.f()' as exact caller, got '{}'",
+            exact[0].text
+        );
+
+        // And none of the returned callers should reference `b.f()`.
+        for c in &callers {
+            assert!(
+                !c.text.contains("b.f()"),
+                "A.f callers should not include b.f() from use_b, got {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_callers_unknown_receiver_marked_ambiguous() {
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+def handle(x):
+    x.f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+
+        // x.f() can't be tied to A or any other class from parameter info
+        // alone. It must be returned with resolution=ambiguous rather than
+        // silently dropped or promoted to exact.
+        assert_eq!(callers.len(), 1, "Expected 1 caller, got {:?}", callers);
+        assert!(
+            callers[0].text.contains("x.f()"),
+            "Expected 'x.f()' call site, got '{}'",
+            callers[0].text
+        );
+        assert_eq!(
+            callers[0].resolution.as_deref(),
+            Some("ambiguous"),
+            "Unknown receiver should be marked ambiguous"
+        );
+        assert!(
+            callers[0].reason.is_some(),
+            "Ambiguous callers should include a reason"
+        );
+    }
+
+    #[test]
+    fn test_find_callers_self_receiver_marked_ambiguous() {
+        // A regression-style fixture modeled after the xanbot broker case:
+        // `self._broker.place_order(...)` cannot be resolved without
+        // data-flow / type analysis, so it must be returned as ambiguous
+        // for all same-named methods (one per broker implementation).
+        let source = r#"
+class LiveBroker:
+    def place_order(self, ticker):
+        pass
+
+class DryRunBroker:
+    def place_order(self, ticker):
+        pass
+
+class Strategy:
+    def __init__(self, broker):
+        self._broker = broker
+
+    def run(self, ticker):
+        self._broker.place_order(ticker)
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let live = find_method(&symbol_table, "main.py", "place_order", "LiveBroker");
+        let dry = find_method(&symbol_table, "main.py", "place_order", "DryRunBroker");
+
+        // Both broker.place_order targets should surface the same ambiguous
+        // self._broker.place_order site — they are honestly ambiguous.
+        for target in &[live, dry] {
+            let callers = find_callers(
+                dir.path(),
+                &file_tree,
+                &symbol_table,
+                &target.name,
+                &target.file,
+                50,
+                Some(target.line_range.0),
+            )
+            .unwrap();
+            assert_eq!(
+                callers.len(),
+                1,
+                "Expected 1 ambiguous caller for {}.place_order, got {:?}",
+                target.parent.as_deref().unwrap_or(""),
+                callers
+            );
+            assert_eq!(
+                callers[0].resolution.as_deref(),
+                Some("ambiguous"),
+                "self._broker.place_order must be classified as ambiguous, not exact"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_callers_no_line_ambiguous_falls_back_to_name_only() {
+        // Regression for codex finding #1: when the caller omits `line`
+        // and the file has multiple same-named methods, `get()` silently
+        // picks the first one. Running definition-aware filtering against
+        // that arbitrary target would drop the *other* same-named methods'
+        // callers. Instead, find_callers must detect the ambiguity and
+        // fall back to name-only matching so both `A().f()` and `B().f()`
+        // are returned.
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+class B:
+    def f(self):
+        pass
+
+A().f()
+B().f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        // No line hint — the caller doesn't know which f to pick.
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "f",
+            "main.py",
+            50,
+            None,
+        )
+        .unwrap();
+
+        // Both A().f() and B().f() must be returned.
+        assert_eq!(
+            callers.len(),
+            2,
+            "Expected 2 callers in name-only fallback, got {:?}",
+            callers
+        );
+        assert!(
+            callers.iter().any(|c| c.text.contains("A().f()")),
+            "Expected A().f() in results"
+        );
+        assert!(
+            callers.iter().any(|c| c.text.contains("B().f()")),
+            "Expected B().f() in results"
+        );
+        // Fallback mode: no resolution metadata should be attached.
+        for c in &callers {
+            assert!(
+                c.resolution.is_none(),
+                "Fallback mode should not emit resolution metadata: {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_callers_reassignment_downgrades_to_ambiguous() {
+        // Regression for codex finding #2: the walker must track the
+        // *latest* binding to `x`, not just the latest known-class
+        // binding. `x = A(); x = make_b(); x.f()` must not be treated as
+        // an exact A.f call.
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+def make_b():
+    return None
+
+def use():
+    x = A()
+    x = make_b()
+    x.f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+
+        // The single x.f() call site must be included, but classified as
+        // ambiguous — never as exact — because the latest binding is
+        // unknown.
+        assert_eq!(callers.len(), 1, "Expected 1 caller, got {:?}", callers);
+        assert_eq!(
+            callers[0].resolution.as_deref(),
+            Some("ambiguous"),
+            "Reassigned variable should be ambiguous, not exact"
+        );
+    }
+
+    #[test]
+    fn test_find_callers_nested_scope_does_not_leak_bindings() {
+        // Regression for codex finding #3: the walker must not descend
+        // into nested `def` / `lambda` / `class`. If an outer `x = A()`
+        // sits lexically next to a `def inner(): x = B()`, then a later
+        // `x.f()` at outer scope should still resolve to A, not B.
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+class B:
+    def f(self):
+        pass
+
+def use():
+    x = A()
+    def inner():
+        x = B()
+        return x
+    x.f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+
+        // The outer x.f() must be an exact A.f match.
+        let exact: Vec<&CallerInfo> = callers
+            .iter()
+            .filter(|c| c.resolution.as_deref() == Some("exact"))
+            .collect();
+        assert_eq!(
+            exact.len(),
+            1,
+            "Expected 1 exact caller for A.f, got {:?}",
+            callers
+        );
+        assert!(
+            exact[0].text.contains("x.f()"),
+            "Expected outer x.f() to be exact, got '{}'",
+            exact[0].text
+        );
+
+        // And B.f must NOT pick up the outer x.f() via the inner `x = B()`.
+        let b_f = find_method(&symbol_table, "main.py", "f", "B");
+        let b_callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &b_f.name,
+            &b_f.file,
+            50,
+            Some(b_f.line_range.0),
+        )
+        .unwrap();
+        let b_exact: Vec<&CallerInfo> = b_callers
+            .iter()
+            .filter(|c| c.resolution.as_deref() == Some("exact"))
+            .collect();
+        assert!(
+            b_exact.is_empty(),
+            "Nested `x = B()` must not leak to outer x.f(); got exact callers {:?}",
+            b_exact
+        );
+    }
+
+    #[test]
+    fn test_find_callers_in_progress_assignment_rhs() {
+        // Regression for codex finding #4: `x = A(x.f())` — the outer
+        // assignment starts before the inner `x.f()` callee but has not
+        // completed. `x` at the moment of the inner call is whatever `x`
+        // was *before* this statement (None here, since nothing set it).
+        // The walker must not count the incomplete `x = A(...)` as a
+        // prior binding.
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+def use(x):
+    x = A(x.f())
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+
+        // The inner x.f() must NOT be classified exact — no completed
+        // prior binding exists.
+        assert_eq!(callers.len(), 1, "Expected 1 caller, got {:?}", callers);
+        assert_eq!(
+            callers[0].resolution.as_deref(),
+            Some("ambiguous"),
+            "In-progress assignment should not count as a prior binding"
+        );
+    }
+
+    #[test]
+    fn test_find_callers_shared_class_function_name_is_ambiguous() {
+        // Regression for codex finding #5: if a class and a function
+        // share a name, `Name(...)` could refer to either. The resolver
+        // must not drop `Name().f()` as a NoMatch for other classes.
+        let source = r#"
+class A:
+    def f(self):
+        pass
+
+class Foo:
+    def f(self):
+        pass
+
+def Foo():
+    return None
+
+Foo().f()
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        // Target: A.f. We should not NoMatch Foo().f() based on the
+        // name shadow — it must be surfaced as ambiguous.
+        let a_f = find_method(&symbol_table, "main.py", "f", "A");
+        let a_callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &a_f.name,
+            &a_f.file,
+            50,
+            Some(a_f.line_range.0),
+        )
+        .unwrap();
+
+        let ambiguous: Vec<&CallerInfo> = a_callers
+            .iter()
+            .filter(|c| c.resolution.as_deref() == Some("ambiguous"))
+            .collect();
+        assert!(
+            !ambiguous.is_empty(),
+            "Expected Foo().f() to be surfaced as ambiguous for A.f target, got {:?}",
+            a_callers
+        );
+        assert!(
+            ambiguous.iter().any(|c| c.text.contains("Foo().f()")),
+            "Expected Foo().f() among ambiguous callers: {:?}",
+            ambiguous
+        );
+    }
+
+    #[test]
+    fn test_find_callers_duplicate_class_name_is_ambiguous() {
+        // Regression for codex finding #5: two modules define a class
+        // named `Inner`. Both `Outer1.Inner.f` and `Outer2.Inner.f` end
+        // up with parent="Inner" in the current representation. An
+        // `Inner().f()` call site cannot be attributed to either, so it
+        // must be returned as ambiguous — not as a false exact for one
+        // of them.
+        let file_a = r#"
+class Outer1:
+    class Inner:
+        def f(self):
+            pass
+"#;
+        let file_b = r#"
+class Outer2:
+    class Inner:
+        def f(self):
+            pass
+"#;
+        let call_site = r#"
+from a import Outer1
+from b import Outer2
+
+Outer1.Inner().f()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[
+            ("a.py", file_a),
+            ("b.py", file_b),
+            ("main.py", call_site),
+        ]);
+
+        let inner_a = find_method(&symbol_table, "a.py", "f", "Inner");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &inner_a.name,
+            &inner_a.file,
+            50,
+            Some(inner_a.line_range.0),
+        )
+        .unwrap();
+
+        // The `Outer1.Inner().f()` call is an attribute-receiver
+        // (`Outer1.Inner()` → attribute access that's called) — it is
+        // correctly ambiguous at the AST level. We only assert that the
+        // receiver scanner did not silently promote it to exact or drop
+        // it as no-match.
+        for c in &callers {
+            assert_ne!(
+                c.resolution.as_deref(),
+                Some("exact"),
+                "Must not claim exact match for ambiguous nested-class name: {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_callers_xanbot_broker_distinguishes_implementations() {
+        // Regression for the original xanbot benchmark: three brokers
+        // each with their own `place_order`, plus a usage site that
+        // constructs each one and calls its method. Before the parser
+        // class-symbol fix, none of these classes were emitted as Class
+        // symbols (because they had `@property` methods), so the
+        // constructor receiver `LiveBroker()` did not match any known
+        // class and the resolver downgraded everything to ambiguous.
+        //
+        // After the fix:
+        //  - LiveBroker.place_order should resolve only `live.place_order()`
+        //    as exact.
+        //  - DryRunBroker.place_order should resolve only `dry.place_order()`
+        //    as exact.
+        //  - PaperBroker.place_order should resolve only `paper.place_order()`
+        //    as exact.
+        //  - The three definitions must NOT all return the same caller list.
+        let source = r#"
+class LiveBroker:
+    @property
+    def order_count(self) -> int:
+        return 0
+
+    def place_order(self, ticker):
+        pass
+
+class DryRunBroker:
+    @property
+    def order_count(self) -> int:
+        return 0
+
+    def place_order(self, ticker):
+        pass
+
+class PaperBroker:
+    @property
+    def order_count(self) -> int:
+        return 0
+
+    def place_order(self, ticker):
+        pass
+
+def use_all():
+    live = LiveBroker()
+    dry = DryRunBroker()
+    paper = PaperBroker()
+    live.place_order("BTC")
+    dry.place_order("BTC")
+    paper.place_order("BTC")
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("brokers.py", source)]);
+
+        // Sanity: all three classes must have been indexed.
+        for cls in &["LiveBroker", "DryRunBroker", "PaperBroker"] {
+            let found = symbol_table
+                .all_symbols()
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == *cls);
+            assert!(found, "Expected Class symbol '{}'", cls);
+        }
+
+        let live_po = find_method(&symbol_table, "brokers.py", "place_order", "LiveBroker");
+        let dry_po = find_method(&symbol_table, "brokers.py", "place_order", "DryRunBroker");
+        let paper_po = find_method(&symbol_table, "brokers.py", "place_order", "PaperBroker");
+
+        let lookup = |target: &Symbol| {
+            find_callers(
+                dir.path(),
+                &file_tree,
+                &symbol_table,
+                &target.name,
+                &target.file,
+                50,
+                Some(target.line_range.0),
+            )
+            .unwrap()
+        };
+
+        let live_callers = lookup(&live_po);
+        let dry_callers = lookup(&dry_po);
+        let paper_callers = lookup(&paper_po);
+
+        // Each must have exactly 1 exact caller, pointing at its own
+        // local-variable invocation.
+        let exact = |callers: &[CallerInfo]| -> Vec<CallerInfo> {
+            callers
+                .iter()
+                .filter(|c| c.resolution.as_deref() == Some("exact"))
+                .cloned()
+                .collect()
+        };
+        let live_exact = exact(&live_callers);
+        let dry_exact = exact(&dry_callers);
+        let paper_exact = exact(&paper_callers);
+
+        assert_eq!(
+            live_exact.len(),
+            1,
+            "LiveBroker.place_order should have 1 exact caller, got {:?}",
+            live_callers
+        );
+        assert!(
+            live_exact[0].text.contains("live.place_order"),
+            "LiveBroker exact caller should be live.place_order, got '{}'",
+            live_exact[0].text
+        );
+
+        assert_eq!(
+            dry_exact.len(),
+            1,
+            "DryRunBroker.place_order should have 1 exact caller, got {:?}",
+            dry_callers
+        );
+        assert!(
+            dry_exact[0].text.contains("dry.place_order"),
+            "DryRunBroker exact caller should be dry.place_order, got '{}'",
+            dry_exact[0].text
+        );
+
+        assert_eq!(
+            paper_exact.len(),
+            1,
+            "PaperBroker.place_order should have 1 exact caller, got {:?}",
+            paper_callers
+        );
+        assert!(
+            paper_exact[0].text.contains("paper.place_order"),
+            "PaperBroker exact caller should be paper.place_order, got '{}'",
+            paper_exact[0].text
+        );
+
+        // The three definitions must NOT return identical caller lists.
+        // Compare just the exact-match texts.
+        let live_text = live_exact[0].text.clone();
+        let dry_text = dry_exact[0].text.clone();
+        let paper_text = paper_exact[0].text.clone();
+        assert_ne!(
+            live_text, dry_text,
+            "Live and Dry must return different exact callers"
+        );
+        assert_ne!(
+            dry_text, paper_text,
+            "Dry and Paper must return different exact callers"
+        );
+        assert_ne!(
+            live_text, paper_text,
+            "Live and Paper must return different exact callers"
+        );
+    }
+
+    #[test]
+    fn test_find_callers_broker_local_constructor_resolves_exactly() {
+        // Minimal version of the xanbot user-reported case:
+        //   broker = DryRunBroker()
+        //   oid = broker.place_order(...)
+        // This must be an exact caller of DryRunBroker.place_order.
+        let source = r#"
+class LiveBroker:
+    @property
+    def name(self) -> str:
+        return "live"
+
+    def place_order(self, ticker):
+        pass
+
+class DryRunBroker:
+    @property
+    def name(self) -> str:
+        return "dry"
+
+    def place_order(self, ticker):
+        pass
+
+def test_dry_run_e2e():
+    broker = DryRunBroker()
+    oid = broker.place_order("token-123")
+    return oid
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("test_dry_run.py", source)]);
+
+        let dry_po = find_method(
+            &symbol_table,
+            "test_dry_run.py",
+            "place_order",
+            "DryRunBroker",
+        );
+        let dry_callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &dry_po.name,
+            &dry_po.file,
+            50,
+            Some(dry_po.line_range.0),
+        )
+        .unwrap();
+
+        let exact: Vec<&CallerInfo> = dry_callers
+            .iter()
+            .filter(|c| c.resolution.as_deref() == Some("exact"))
+            .collect();
+        assert_eq!(
+            exact.len(),
+            1,
+            "Expected 1 exact caller for DryRunBroker.place_order, got {:?}",
+            dry_callers
+        );
+        assert!(
+            exact[0].text.contains("broker.place_order"),
+            "Expected broker.place_order to be exact, got '{}'",
+            exact[0].text
+        );
+
+        // LiveBroker.place_order should NOT pick this up — `broker` is
+        // unambiguously bound from `DryRunBroker()`.
+        let live_po = find_method(
+            &symbol_table,
+            "test_dry_run.py",
+            "place_order",
+            "LiveBroker",
+        );
+        let live_callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &live_po.name,
+            &live_po.file,
+            50,
+            Some(live_po.line_range.0),
+        )
+        .unwrap();
+        let live_exact: Vec<&CallerInfo> = live_callers
+            .iter()
+            .filter(|c| c.resolution.as_deref() == Some("exact"))
+            .collect();
+        assert!(
+            live_exact.is_empty(),
+            "LiveBroker.place_order should have NO exact callers in this fixture, got {:?}",
+            live_exact
+        );
+    }
+
+    #[test]
+    fn test_find_callers_non_method_target_unchanged() {
+        // Python free functions should not grow resolution metadata — the
+        // old name-only behavior must still apply so non-method callers
+        // are unaffected.
+        let source = r#"
+def helper(x):
+    return x
+
+def main():
+    helper(1)
+    helper(2)
+"#;
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("main.py", source)]);
+
+        let helper = symbol_table
+            .find_by_file_and_name("main.py", "helper")
+            .into_iter()
+            .next()
+            .expect("Expected helper function");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &helper.name,
+            &helper.file,
+            50,
+            Some(helper.line_range.0),
+        )
+        .unwrap();
+
+        assert_eq!(callers.len(), 2, "Expected 2 callers of helper");
+        for c in &callers {
+            assert!(
+                c.resolution.is_none(),
+                "Free-function callers should not carry resolution metadata: {:?}",
+                c
+            );
+        }
     }
 }

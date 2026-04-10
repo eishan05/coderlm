@@ -113,23 +113,10 @@ fn test_callers_tool_registered() {
 }
 
 #[test]
-fn test_dependents_tool_registered() {
-    let attr = CoderlmMcpServer::coderlm_dependents_tool_attr();
-    assert_eq!(attr.name, "coderlm_dependents");
-    assert!(attr.annotations.as_ref().unwrap().read_only_hint == Some(true));
-}
-
-#[test]
-fn test_only_two_tools_are_registered() {
-    // Verify the full set of exposed tools is exactly {callers, dependents}.
-    let names = vec![
-        CoderlmMcpServer::coderlm_callers_tool_attr().name,
-        CoderlmMcpServer::coderlm_dependents_tool_attr().name,
-    ];
-    assert_eq!(names.len(), 2);
-    let names: Vec<&str> = names.iter().map(|s| s.as_ref()).collect();
-    assert!(names.contains(&"coderlm_callers"));
-    assert!(names.contains(&"coderlm_dependents"));
+fn test_only_one_tool_is_registered() {
+    // Verify the full set of exposed tools is exactly {callers}.
+    let attr = CoderlmMcpServer::coderlm_callers_tool_attr();
+    assert_eq!(attr.name, "coderlm_callers");
 }
 
 // ---------------------------------------------------------------------------
@@ -172,19 +159,6 @@ async fn test_coderlm_callers_error_for_missing_symbol() {
     assert!(result.starts_with("Error:"), "Expected error, got: {}", result);
 }
 
-#[tokio::test]
-async fn test_coderlm_dependents_returns_valid_json() {
-    let (_dir, server) = setup_test_server();
-    wait_for_indexing(&server).await;
-
-    let result = server.coderlm_dependents(Parameters(DependentsParams {
-        file: "lib".to_string(),
-    }));
-    // Should be a valid JSON response (possibly empty dependents list).
-    let _parsed: serde_json::Value = serde_json::from_str(&result)
-        .unwrap_or_else(|e| panic!("Dependents result not valid JSON: {}. Got: {}", e, result));
-}
-
 // ---------------------------------------------------------------------------
 // Schema generation tests
 // ---------------------------------------------------------------------------
@@ -201,14 +175,3 @@ fn test_callers_params_schema_has_required_fields() {
     assert!(props.contains_key("line"), "Schema should have 'line'");
 }
 
-#[test]
-fn test_dependents_params_schema_has_required_fields() {
-    let attr = CoderlmMcpServer::coderlm_dependents_tool_attr();
-    let schema = &attr.input_schema;
-    let props = schema.get("properties").and_then(|p| p.as_object());
-    assert!(props.is_some(), "Schema should have properties");
-    assert!(
-        props.unwrap().contains_key("file"),
-        "Schema should have 'file' property"
-    );
-}

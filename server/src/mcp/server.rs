@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::ops::{imports, symbol_ops};
+use crate::ops::symbol_ops;
 use crate::server::state::{AppState, Project};
 
 // ---------------------------------------------------------------------------
@@ -36,13 +36,6 @@ pub struct CallersParams {
     /// Optional line number to disambiguate same-named symbols in the same file.
     #[serde(default)]
     pub line: Option<usize>,
-}
-
-/// Parameters for `coderlm_dependents` — find files that import from a given module.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct DependentsParams {
-    /// Module/file path to find dependents for (substring match).
-    pub file: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,21 +123,6 @@ impl CoderlmMcpServer {
         }
     }
 
-    /// Finds files that depend on (import from) a given module or file path.
-    /// Uses substring matching, so searching for "utils" will find files
-    /// importing "./utils", "../utils", "project/utils", etc.
-    #[tool(
-        name = "coderlm_dependents",
-        annotations(read_only_hint = true, title = "Find Dependents")
-    )]
-    pub fn coderlm_dependents(&self, params: Parameters<DependentsParams>) -> String {
-        let p = &params.0;
-        match imports::get_dependents(&self.project().import_table, &p.file) {
-            Ok(result) => serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|e| format!("Error: {}", e)),
-            Err(e) => format!("Error: {}", e),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +139,7 @@ impl ServerHandler for CoderlmMcpServer {
             ))
             .with_instructions(
                 "CodeRLM is a code-aware index server. Use coderlm_callers to \
-                 find call sites of a symbol, and coderlm_dependents to find \
-                 files that import from a given module.",
+                 find call sites of a symbol.",
             )
     }
 }

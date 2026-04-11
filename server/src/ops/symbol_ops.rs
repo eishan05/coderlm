@@ -5,9 +5,9 @@ use tree_sitter::StreamingIterator;
 
 use crate::index::file_entry::Language;
 use crate::index::file_tree::FileTree;
+use crate::symbols::SymbolTable;
 use crate::symbols::queries::{self, TestPattern};
 use crate::symbols::symbol::{Symbol, SymbolKind};
-use crate::symbols::SymbolTable;
 
 pub fn list_symbols(
     symbol_table: &Arc<SymbolTable>,
@@ -25,7 +25,11 @@ pub fn list_symbols(
         results.retain(|s| s.kind == kind);
     }
 
-    results.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_range.0.cmp(&b.line_range.0)));
+    results.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line_range.0.cmp(&b.line_range.0))
+    });
     results.truncate(limit);
     results
 }
@@ -77,7 +81,9 @@ pub fn get_implementation(
     if start >= source.len() {
         return Err(format!(
             "Symbol '{}' source is stale (byte_range start {} >= file length {}). File has been modified.",
-            symbol_name, start, source.len()
+            symbol_name,
+            start,
+            source.len()
         ));
     }
 
@@ -85,10 +91,13 @@ pub fn get_implementation(
     let (warning, candidates) = if line.is_none() {
         let matches = symbol_table.find_by_file_and_name(file, symbol_name);
         if matches.len() > 1 {
-            let cands: Vec<ImplCandidate> = matches.iter().map(|s| ImplCandidate {
-                line: s.line_range.0,
-                parent: s.parent.clone(),
-            }).collect();
+            let cands: Vec<ImplCandidate> = matches
+                .iter()
+                .map(|s| ImplCandidate {
+                    line: s.line_range.0,
+                    parent: s.parent.clone(),
+                })
+                .collect();
             (
                 Some(format!(
                     "{} matches found, returning first. Use 'line' to disambiguate.",
@@ -158,6 +167,13 @@ pub fn redefine_symbol(
 
 /// Find callers of a symbol using tree-sitter call-expression queries.
 /// Falls back to regex for files without tree-sitter support.
+///
+/// `symbol_name` may be a bare name (`"method"`) or a qualified name
+/// (`"ClassName.method"`). When qualified, the method is looked up by its
+/// bare name and then filtered to the symbol whose `parent` matches.
+///
+/// `include_paths` / `exclude_paths` restrict which indexed files are
+/// scanned. Each entry is matched as a prefix against the relative path.
 pub fn find_callers(
     root: &Path,
     file_tree: &Arc<FileTree>,
@@ -166,13 +182,72 @@ pub fn find_callers(
     file: &str,
     limit: usize,
     line: Option<usize>,
+    include_paths: Option<&[String]>,
+    exclude_paths: Option<&[String]>,
 ) -> Result<Vec<CallerInfo>, String> {
+    // Handle qualified names: "ClassName.method" → look up "method" with
+    // parent == "ClassName".
+    let (bare_name, qualified_parent) = if let Some(dot_pos) = symbol_name.rfind('.') {
+        let class = &symbol_name[..dot_pos];
+        let method = &symbol_name[dot_pos + 1..];
+        if class.is_empty() || method.is_empty() {
+            (symbol_name, None)
+        } else {
+            (method, Some(class.to_string()))
+        }
+    } else {
+        (symbol_name, None)
+    };
+
     // Verify symbol exists and capture its identity (kind, language, parent
     // class) so caller scanning can scope matches to the right definition
     // rather than just matching by name.
-    let mut target = symbol_table
-        .get(file, symbol_name, line)
-        .ok_or_else(|| format!("Symbol '{}' not found in '{}'", symbol_name, file))?;
+    let mut target = if let Some(ref qp) = qualified_parent {
+        // Qualified lookup: find by bare name, filter by parent class.
+        // If a line hint is also present, use it for exact disambiguation.
+        if let Some(ln) = line {
+            symbol_table.get(file, bare_name, Some(ln)).ok_or_else(|| {
+                format!(
+                    "Symbol '{}.{}' not found in '{}' at line {}",
+                    qp, bare_name, file, ln
+                )
+            })?
+        } else {
+            let candidates = symbol_table.find_by_file_and_name(file, bare_name);
+            let matching: Vec<_> = candidates
+                .into_iter()
+                .filter(|s| s.parent.as_deref() == Some(qp.as_str()))
+                .collect();
+            match matching.len() {
+                0 => {
+                    return Err(format!(
+                        "Symbol '{}.{}' not found in '{}'",
+                        qp, bare_name, file
+                    ));
+                }
+                1 => matching.into_iter().next().unwrap(),
+                n => {
+                    let lines: Vec<String> = matching
+                        .iter()
+                        .map(|s| s.line_range.0.to_string())
+                        .collect();
+                    return Err(format!(
+                        "Symbol '{}.{}' is ambiguous in '{}' ({} matches at lines {}). \
+                         Pass line= to disambiguate.",
+                        qp,
+                        bare_name,
+                        file,
+                        n,
+                        lines.join(", ")
+                    ));
+                }
+            }
+        }
+    } else {
+        symbol_table
+            .get(file, bare_name, line)
+            .ok_or_else(|| format!("Symbol '{}' not found in '{}'", bare_name, file))?
+    };
 
     // If the caller did not provide a line hint and the file has multiple
     // same-named symbols, `get()` silently picks the first one by line
@@ -181,8 +256,8 @@ pub fn find_callers(
     // same-named definitions — a silent regression vs the old name-only
     // behavior. Detect this ambiguity and fall back to name-only matching
     // by clearing `parent` on the working target copy.
-    if line.is_none() {
-        let same_named = symbol_table.find_by_file_and_name(file, symbol_name);
+    if line.is_none() && qualified_parent.is_none() {
+        let same_named = symbol_table.find_by_file_and_name(file, bare_name);
         if same_named.len() > 1 {
             target.parent = None;
         }
@@ -204,6 +279,18 @@ pub fn find_callers(
             continue;
         }
 
+        // Apply path filters before reading the file.
+        if let Some(includes) = include_paths {
+            if !includes.is_empty() && !includes.iter().any(|p| rel_path.starts_with(p.as_str())) {
+                continue;
+            }
+        }
+        if let Some(excludes) = exclude_paths {
+            if excludes.iter().any(|p| rel_path.starts_with(p.as_str())) {
+                continue;
+            }
+        }
+
         let abs_path = root.join(&rel_path);
 
         let source = match std::fs::read_to_string(&abs_path) {
@@ -214,7 +301,7 @@ pub fn find_callers(
         let file_callers = if language.has_tree_sitter_support() {
             find_callers_ast(&source, &rel_path, language, &target, symbol_table)
         } else {
-            find_callers_regex(&source, &rel_path, symbol_name, file)
+            find_callers_regex(&source, &rel_path, bare_name, file)
         };
 
         for caller in file_callers {
@@ -369,13 +456,13 @@ fn resolve_python_receiver(
                     ReceiverResolution::NoMatch
                 }
             }
-            Some(LocalBinding::AmbiguousClass(class_name)) => ReceiverResolution::Ambiguous(
-                format!(
+            Some(LocalBinding::AmbiguousClass(class_name)) => {
+                ReceiverResolution::Ambiguous(format!(
                     "local '{}' was assigned from '{}' but that name is ambiguous \
                      (multiple classes or class/non-class name collision)",
                     ident, class_name
-                ),
-            ),
+                ))
+            }
             Some(LocalBinding::Other) => ReceiverResolution::Ambiguous(format!(
                 "local '{}' was reassigned from a non-constructor expression before \
                  this call",
@@ -564,7 +651,10 @@ fn classify_assignment_rhs(
     if rhs.kind() == "call" {
         if let Some(fn_node) = rhs.child_by_field_name("function") {
             if fn_node.kind() == "identifier" {
-                let cls = fn_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                let cls = fn_node
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .to_string();
                 return match classify_name(symbol_table, &cls) {
                     NameClassification::UniqueClass => LocalBinding::UniqueClass(cls),
                     NameClassification::Ambiguous => LocalBinding::AmbiguousClass(cls),
@@ -574,6 +664,75 @@ fn classify_assignment_rhs(
         }
     }
     LocalBinding::Other
+}
+
+/// Extract 2 lines before + the call line + 2 lines after as context.
+fn extract_context(source: &str, line_num: usize) -> (String, usize) {
+    let lines: Vec<&str> = source.lines().collect();
+    let start = if line_num > 2 { line_num - 2 } else { 1 };
+    let end = (line_num + 2).min(lines.len());
+    let snippet: Vec<&str> = lines[(start - 1)..end].to_vec();
+    (snippet.join("\n"), start)
+}
+
+/// Walk from `node` up the tree to find the enclosing function and class.
+/// Returns `(function_name, class_name)`. Language-agnostic: checks for
+/// common tree-sitter node kinds across Python, Rust, TS, Go, Java, Scala.
+fn enclosing_function_and_class(
+    node: tree_sitter::Node,
+    source: &str,
+) -> (Option<String>, Option<String>) {
+    let mut func_name: Option<String> = None;
+    let mut class_name: Option<String> = None;
+
+    let func_kinds = [
+        "function_definition",  // Python, Rust
+        "function_declaration", // TS/JS, Go
+        "method_declaration",   // Java
+        "function_item",        // Rust (top-level fn)
+        "lambda",               // Python lambda
+        "function_definition",  // Scala
+    ];
+    let class_kinds = [
+        "class_definition",  // Python, Scala
+        "class_declaration", // Java, TS/JS
+        "impl_item",         // Rust
+        "struct_item",       // Rust
+    ];
+
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        let kind = n.kind();
+        if func_name.is_none() && func_kinds.contains(&kind) {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                func_name = name_node
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string());
+            }
+        }
+        if class_name.is_none() && class_kinds.contains(&kind) {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                class_name = name_node
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string());
+            } else if kind == "impl_item" {
+                // Rust impl blocks use "type" field instead of "name"
+                if let Some(type_node) = n.child_by_field_name("type") {
+                    class_name = type_node
+                        .utf8_text(source.as_bytes())
+                        .ok()
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+        if func_name.is_some() && class_name.is_some() {
+            break;
+        }
+        cur = n.parent();
+    }
+    (func_name, class_name)
 }
 
 /// AST-aware caller detection: parse the file, run the callers query,
@@ -613,7 +772,11 @@ fn find_callers_ast(
         Err(_) => return find_callers_regex(source, rel_path, symbol_name, definition_file),
     };
 
-    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let capture_names: Vec<String> = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let callee_idx = capture_names.iter().position(|n| n == "callee");
     let receiver_idx = capture_names.iter().position(|n| n == "receiver");
 
@@ -622,6 +785,10 @@ fn find_callers_ast(
     let python_method_target = target.language == Language::Python
         && target.kind == SymbolKind::Method
         && target.parent.is_some();
+
+    // Determine call_form for non-method targets: free functions get
+    // "function_call", everything else gets None.
+    let is_free_function = target.kind == SymbolKind::Function;
 
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
@@ -668,7 +835,7 @@ fn find_callers_ast(
             .unwrap_or_default();
 
         // Decide what resolution metadata, if any, to attach.
-        let (resolution, reason) = if python_method_target {
+        let (resolution, reason, call_form) = if python_method_target {
             let target_parent = target.parent.as_deref().unwrap_or("");
             match receiver_cap {
                 Some(rcap) => {
@@ -679,11 +846,17 @@ fn find_callers_ast(
                         target_parent,
                         symbol_table,
                     ) {
-                        ReceiverResolution::Exact => (Some("exact".to_string()), None),
+                        ReceiverResolution::Exact => (
+                            Some("exact".to_string()),
+                            None,
+                            Some("method_call".to_string()),
+                        ),
                         ReceiverResolution::NoMatch => continue,
-                        ReceiverResolution::Ambiguous(reason) => {
-                            (Some("ambiguous".to_string()), Some(reason))
-                        }
+                        ReceiverResolution::Ambiguous(reason) => (
+                            Some("ambiguous".to_string()),
+                            Some(reason),
+                            Some("method_call".to_string()),
+                        ),
                     }
                 }
                 None => {
@@ -693,16 +866,22 @@ fn find_callers_ast(
                     // ambiguous rather than silently including it as exact.
                     (
                         Some("ambiguous".to_string()),
-                        Some(
-                            "bare call has no receiver — cannot tie to any class"
-                                .to_string(),
-                        ),
+                        Some("bare call has no receiver — cannot tie to any class".to_string()),
+                        Some("bare_call".to_string()),
                     )
                 }
             }
+        } else if is_free_function {
+            (None, None, Some("function_call".to_string()))
         } else {
-            (None, None)
+            (None, None, None)
         };
+
+        // Enclosing function/class for the call site.
+        let (calling_function, calling_class) = enclosing_function_and_class(cap.node, source);
+
+        // Context: a few lines around the call.
+        let (context, context_start_line) = extract_context(source, line_num);
 
         callers.push(CallerInfo {
             file: rel_path.to_string(),
@@ -710,6 +889,11 @@ fn find_callers_ast(
             text: line_text,
             resolution,
             reason,
+            calling_function,
+            calling_class,
+            call_form,
+            context: Some(context),
+            context_start_line: Some(context_start_line),
         });
     }
 
@@ -741,12 +925,19 @@ fn find_callers_regex(
                 continue;
             }
 
+            let one_based = line_num + 1;
+            let (context, context_start_line) = extract_context(source, one_based);
             callers.push(CallerInfo {
                 file: rel_path.to_string(),
-                line: line_num + 1,
+                line: one_based,
                 text: line.trim().to_string(),
                 resolution: None,
                 reason: None,
+                calling_function: None,
+                calling_class: None,
+                call_form: None,
+                context: Some(context),
+                context_start_line: Some(context_start_line),
             });
         }
     }
@@ -782,19 +973,24 @@ fn is_definition_line(line: &str, name: &str, language: Language) -> bool {
         Language::Rust => line.contains(&format!("fn {}", name)),
         Language::Python => line.contains(&format!("def {}", name)),
         Language::TypeScript | Language::JavaScript => {
-            line.contains(&format!("function {}", name))
-                || line.contains(&format!("{} =", name))
+            line.contains(&format!("function {}", name)) || line.contains(&format!("{} =", name))
         }
         Language::Go => line.contains(&format!("func {}", name)),
         Language::Java => {
             line.contains(&format!("class {}", name))
                 || line.contains(&format!("interface {}", name))
                 || line.contains(&format!("enum {}", name))
-                || (line.contains(name) && (line.contains("void ") || line.contains("int ")
-                    || line.contains("String ") || line.contains("boolean ")
-                    || line.contains("long ") || line.contains("double ")
-                    || line.contains("float ") || line.contains("public ")
-                    || line.contains("private ") || line.contains("protected ")))
+                || (line.contains(name)
+                    && (line.contains("void ")
+                        || line.contains("int ")
+                        || line.contains("String ")
+                        || line.contains("boolean ")
+                        || line.contains("long ")
+                        || line.contains("double ")
+                        || line.contains("float ")
+                        || line.contains("public ")
+                        || line.contains("private ")
+                        || line.contains("protected ")))
         }
         Language::Scala => {
             line.contains(&format!("def {}", name))
@@ -833,6 +1029,24 @@ pub struct CallerInfo {
     /// `None` for exact matches and when resolution is not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Name of the function/method enclosing this call site.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calling_function: Option<String>,
+    /// Name of the class enclosing this call site (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calling_class: Option<String>,
+    /// Shape of the call expression:
+    /// - `"method_call"`: receiver-qualified call (`obj.method()`)
+    /// - `"bare_call"`: unqualified call to a method-named symbol (`method()`)
+    /// - `"function_call"`: call to a free function target
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_form: Option<String>,
+    /// A few lines of source around the call site for immediate context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// The 1-indexed line number where `context` starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_start_line: Option<usize>,
 }
 
 /// Find test functions that reference a given symbol.
@@ -1020,7 +1234,9 @@ pub fn list_variables(
     if start >= source.len() {
         return Err(format!(
             "Symbol '{}' source is stale (byte_range start {} >= file length {}). File has been modified.",
-            function_name, start, source.len()
+            function_name,
+            start,
+            source.len()
         ));
     }
 
@@ -1062,7 +1278,11 @@ fn list_variables_ast(
         Err(_) => return list_variables_regex(&source[fn_start..fn_end], language, function_name),
     };
 
-    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let capture_names: Vec<String> = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let var_name_idx = capture_names.iter().position(|n| n == "var.name");
 
     let mut cursor = tree_sitter::QueryCursor::new();
@@ -1076,7 +1296,11 @@ fn list_variables_ast(
         for cap in m.captures {
             if Some(cap.index as usize) == var_name_idx {
                 let text = cap.node.utf8_text(source.as_bytes()).unwrap_or("");
-                if !text.is_empty() && text != "self" && text != "_" && seen.insert(text.to_string()) {
+                if !text.is_empty()
+                    && text != "self"
+                    && text != "_"
+                    && seen.insert(text.to_string())
+                {
                     variables.push(VariableInfo {
                         name: text.to_string(),
                         function: function_name.to_string(),
@@ -1090,11 +1314,7 @@ fn list_variables_ast(
 }
 
 /// Regex fallback for variable extraction.
-fn list_variables_regex(
-    body: &str,
-    language: Language,
-    function_name: &str,
-) -> Vec<VariableInfo> {
+fn list_variables_regex(body: &str, language: Language, function_name: &str) -> Vec<VariableInfo> {
     let mut variables = Vec::new();
 
     match language {
@@ -1834,12 +2054,7 @@ mod tests {
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
 
-        let result = generate_outline(
-            dir.path(),
-            &file_tree,
-            &symbol_table,
-            "nonexistent.rs",
-        );
+        let result = generate_outline(dir.path(), &file_tree, &symbol_table, "nonexistent.rs");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -1851,7 +2066,8 @@ mod tests {
         use crate::symbols::SymbolTable;
 
         let dir = tempfile::tempdir().unwrap();
-        let source = "fn hello() {\n    println!(\"Hello\");\n}\n\nstruct Foo {\n    bar: i32,\n}\n";
+        let source =
+            "fn hello() {\n    println!(\"Hello\");\n}\n\nstruct Foo {\n    bar: i32,\n}\n";
         std::fs::write(dir.path().join("main.rs"), source).unwrap();
 
         let file_tree = Arc::new(FileTree::new());
@@ -1889,13 +2105,7 @@ mod tests {
             doc_comment: None,
         });
 
-        let outline = generate_outline(
-            dir.path(),
-            &file_tree,
-            &symbol_table,
-            "main.rs",
-        )
-        .unwrap();
+        let outline = generate_outline(dir.path(), &file_tree, &symbol_table, "main.rs").unwrap();
 
         assert_eq!(outline.file, "main.rs");
         assert_eq!(outline.language, Language::Rust);
@@ -1931,13 +2141,7 @@ mod tests {
 
         let symbol_table = Arc::new(SymbolTable::new());
 
-        let outline = generate_outline(
-            dir.path(),
-            &file_tree,
-            &symbol_table,
-            "empty.rs",
-        )
-        .unwrap();
+        let outline = generate_outline(dir.path(), &file_tree, &symbol_table, "empty.rs").unwrap();
 
         assert_eq!(outline.file, "empty.rs");
         assert_eq!(outline.line_count, 1);
@@ -1989,13 +2193,7 @@ mod tests {
             doc_comment: None,
         });
 
-        let outline = generate_outline(
-            dir.path(),
-            &file_tree,
-            &symbol_table,
-            "lib.rs",
-        )
-        .unwrap();
+        let outline = generate_outline(dir.path(), &file_tree, &symbol_table, "lib.rs").unwrap();
 
         // Structs before Methods
         assert_eq!(outline.groups.len(), 2);
@@ -2119,8 +2317,8 @@ EOF
     //   flag instead of being silently presented as exact matches.
 
     use crate::index::file_tree::FileTree;
-    use crate::symbols::parser;
     use crate::symbols::SymbolTable;
+    use crate::symbols::parser;
     use tempfile::TempDir;
 
     /// Index a temp directory containing Python files and return the
@@ -2159,12 +2357,7 @@ EOF
 
     /// Helper: find a Python method by name + parent class name so tests
     /// can unambiguously reference `A.f` vs `B.f`.
-    fn find_method(
-        symbol_table: &SymbolTable,
-        file: &str,
-        name: &str,
-        parent: &str,
-    ) -> Symbol {
+    fn find_method(symbol_table: &SymbolTable, file: &str, name: &str, parent: &str) -> Symbol {
         symbol_table
             .find_by_file_and_name(file, name)
             .into_iter()
@@ -2186,8 +2379,7 @@ class B:
 A().f()
 B().f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let a_f = find_method(&symbol_table, "main.py", "f", "A");
         let b_f = find_method(&symbol_table, "main.py", "f", "B");
@@ -2201,6 +2393,8 @@ B().f()
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2229,6 +2423,8 @@ B().f()
             &b_f.file,
             50,
             Some(b_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2264,8 +2460,7 @@ def use_b():
     b = B()
     b.f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let a_f = find_method(&symbol_table, "main.py", "f", "A");
         let callers = find_callers(
@@ -2276,6 +2471,8 @@ def use_b():
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2317,8 +2514,7 @@ class A:
 def handle(x):
     x.f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let a_f = find_method(&symbol_table, "main.py", "f", "A");
         let callers = find_callers(
@@ -2329,6 +2525,8 @@ def handle(x):
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2374,8 +2572,7 @@ class Strategy:
     def run(self, ticker):
         self._broker.place_order(ticker)
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let live = find_method(&symbol_table, "main.py", "place_order", "LiveBroker");
         let dry = find_method(&symbol_table, "main.py", "place_order", "DryRunBroker");
@@ -2391,6 +2588,8 @@ class Strategy:
                 &target.file,
                 50,
                 Some(target.line_range.0),
+                None,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -2429,8 +2628,7 @@ class B:
 A().f()
 B().f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         // No line hint — the caller doesn't know which f to pick.
         let callers = find_callers(
@@ -2440,6 +2638,8 @@ B().f()
             "f",
             "main.py",
             50,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -2488,8 +2688,7 @@ def use():
     x = make_b()
     x.f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let a_f = find_method(&symbol_table, "main.py", "f", "A");
         let callers = find_callers(
@@ -2500,6 +2699,8 @@ def use():
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2536,8 +2737,7 @@ def use():
         return x
     x.f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let a_f = find_method(&symbol_table, "main.py", "f", "A");
         let callers = find_callers(
@@ -2548,6 +2748,8 @@ def use():
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2578,6 +2780,8 @@ def use():
             &b_f.file,
             50,
             Some(b_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
         let b_exact: Vec<&CallerInfo> = b_callers
@@ -2607,8 +2811,7 @@ class A:
 def use(x):
     x = A(x.f())
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let a_f = find_method(&symbol_table, "main.py", "f", "A");
         let callers = find_callers(
@@ -2619,6 +2822,8 @@ def use(x):
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2651,8 +2856,7 @@ def Foo():
 
 Foo().f()
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         // Target: A.f. We should not NoMatch Foo().f() based on the
         // name shadow — it must be surfaced as ambiguous.
@@ -2665,6 +2869,8 @@ Foo().f()
             &a_f.file,
             50,
             Some(a_f.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2710,11 +2916,8 @@ from b import Outer2
 
 Outer1.Inner().f()
 "#;
-        let (dir, file_tree, symbol_table) = index_python_project(&[
-            ("a.py", file_a),
-            ("b.py", file_b),
-            ("main.py", call_site),
-        ]);
+        let (dir, file_tree, symbol_table) =
+            index_python_project(&[("a.py", file_a), ("b.py", file_b), ("main.py", call_site)]);
 
         let inner_a = find_method(&symbol_table, "a.py", "f", "Inner");
         let callers = find_callers(
@@ -2725,6 +2928,8 @@ Outer1.Inner().f()
             &inner_a.file,
             50,
             Some(inner_a.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2794,8 +2999,7 @@ def use_all():
     dry.place_order("BTC")
     paper.place_order("BTC")
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("brokers.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("brokers.py", source)]);
 
         // Sanity: all three classes must have been indexed.
         for cls in &["LiveBroker", "DryRunBroker", "PaperBroker"] {
@@ -2819,6 +3023,8 @@ def use_all():
                 &target.file,
                 50,
                 Some(target.line_range.0),
+                None,
+                None,
             )
             .unwrap()
         };
@@ -2923,8 +3129,7 @@ def test_dry_run_e2e():
     oid = broker.place_order("token-123")
     return oid
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("test_dry_run.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("test_dry_run.py", source)]);
 
         let dry_po = find_method(
             &symbol_table,
@@ -2940,6 +3145,8 @@ def test_dry_run_e2e():
             &dry_po.file,
             50,
             Some(dry_po.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2975,6 +3182,8 @@ def test_dry_run_e2e():
             &live_po.file,
             50,
             Some(live_po.line_range.0),
+            None,
+            None,
         )
         .unwrap();
         let live_exact: Vec<&CallerInfo> = live_callers
@@ -3001,8 +3210,7 @@ def main():
     helper(1)
     helper(2)
 "#;
-        let (dir, file_tree, symbol_table) =
-            index_python_project(&[("main.py", source)]);
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
 
         let helper = symbol_table
             .find_by_file_and_name("main.py", "helper")
@@ -3017,6 +3225,8 @@ def main():
             &helper.file,
             50,
             Some(helper.line_range.0),
+            None,
+            None,
         )
         .unwrap();
 
@@ -3028,5 +3238,433 @@ def main():
                 c
             );
         }
+    }
+
+    // ── Qualified name support ──────────────────────────────────────────
+
+    #[test]
+    fn test_find_callers_qualified_name() {
+        let source = r#"
+class Foo:
+    def run(self):
+        pass
+
+class Bar:
+    def run(self):
+        pass
+
+Foo().run()
+Bar().run()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        // Using "Foo.run" should find only Foo().run()
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "Foo.run",
+            "main.py",
+            50,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            callers.len(),
+            1,
+            "Expected 1 caller for Foo.run, got {:?}",
+            callers
+        );
+        assert!(callers[0].text.contains("Foo().run()"));
+        assert_eq!(callers[0].resolution.as_deref(), Some("exact"));
+
+        // Using "Bar.run" should find only Bar().run()
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "Bar.run",
+            "main.py",
+            50,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            callers.len(),
+            1,
+            "Expected 1 caller for Bar.run, got {:?}",
+            callers
+        );
+        assert!(callers[0].text.contains("Bar().run()"));
+    }
+
+    #[test]
+    fn test_find_callers_qualified_name_not_found() {
+        let source = r#"
+class Foo:
+    def run(self):
+        pass
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        let result = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "NoSuchClass.run",
+            "main.py",
+            50,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_find_callers_qualified_name_with_line_hint() {
+        let source = r#"
+class Foo:
+    def run(self):
+        pass
+
+class Bar:
+    def run(self):
+        pass
+
+Foo().run()
+Bar().run()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        let foo_run = find_method(&symbol_table, "main.py", "run", "Foo");
+
+        // Qualified name + line hint should also work
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            "Foo.run",
+            "main.py",
+            50,
+            Some(foo_run.line_range.0),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(callers.len(), 1);
+        assert!(callers[0].text.contains("Foo().run()"));
+    }
+
+    // ── Path filter support ─────────────────────────────────────────────
+
+    #[test]
+    fn test_find_callers_include_paths() {
+        let source_lib = r#"
+class Widget:
+    def draw(self):
+        pass
+"#;
+        let source_a = r#"
+from lib import Widget
+Widget().draw()
+"#;
+        let source_b = r#"
+from lib import Widget
+Widget().draw()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[
+            ("lib.py", source_lib),
+            ("src/a.py", source_a),
+            ("tests/b.py", source_b),
+        ]);
+
+        let draw = find_method(&symbol_table, "lib.py", "draw", "Widget");
+
+        // Only include src/ — should exclude tests/b.py
+        let includes = vec!["src/".to_string()];
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &draw.name,
+            &draw.file,
+            50,
+            Some(draw.line_range.0),
+            Some(&includes),
+            None,
+        )
+        .unwrap();
+        assert!(
+            callers.iter().all(|c| c.file.starts_with("src/")),
+            "All callers should be in src/, got {:?}",
+            callers.iter().map(|c| &c.file).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_find_callers_exclude_paths() {
+        let source_lib = r#"
+class Widget:
+    def draw(self):
+        pass
+"#;
+        let source_a = r#"
+from lib import Widget
+Widget().draw()
+"#;
+        let source_b = r#"
+from lib import Widget
+Widget().draw()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[
+            ("lib.py", source_lib),
+            ("src/a.py", source_a),
+            ("tests/b.py", source_b),
+        ]);
+
+        let draw = find_method(&symbol_table, "lib.py", "draw", "Widget");
+
+        // Exclude tests/ — should only find callers outside tests/
+        let excludes = vec!["tests/".to_string()];
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &draw.name,
+            &draw.file,
+            50,
+            Some(draw.line_range.0),
+            None,
+            Some(&excludes),
+        )
+        .unwrap();
+        assert!(
+            callers.iter().all(|c| !c.file.starts_with("tests/")),
+            "No callers should be in tests/, got {:?}",
+            callers.iter().map(|c| &c.file).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Enclosing caller (calling_function / calling_class) ─────────────
+
+    #[test]
+    fn test_find_callers_calling_function_and_class() {
+        let source = r#"
+class Target:
+    def do_work(self):
+        pass
+
+class Caller:
+    def invoke(self):
+        Target().do_work()
+
+def standalone():
+    Target().do_work()
+
+Target().do_work()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        let do_work = find_method(&symbol_table, "main.py", "do_work", "Target");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &do_work.name,
+            &do_work.file,
+            50,
+            Some(do_work.line_range.0),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            callers.len() >= 2,
+            "Expected at least 2 callers, got {:?}",
+            callers
+        );
+
+        // The caller inside Caller.invoke should have both calling_function and calling_class
+        let method_caller = callers
+            .iter()
+            .find(|c| c.calling_function.as_deref() == Some("invoke"))
+            .expect("Expected a caller from Caller.invoke");
+        assert_eq!(method_caller.calling_class.as_deref(), Some("Caller"));
+
+        // The caller inside standalone() should have calling_function but no calling_class
+        let fn_caller = callers
+            .iter()
+            .find(|c| c.calling_function.as_deref() == Some("standalone"))
+            .expect("Expected a caller from standalone()");
+        assert!(fn_caller.calling_class.is_none());
+    }
+
+    // ── Call form classification ─────────────────────────────────────────
+
+    #[test]
+    fn test_find_callers_call_form_method_vs_bare() {
+        let source = r#"
+class Service:
+    def process(self):
+        pass
+
+def process():
+    """A free function with the same name."""
+    pass
+
+Service().process()
+process()
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        let method = find_method(&symbol_table, "main.py", "process", "Service");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &method.name,
+            &method.file,
+            50,
+            Some(method.line_range.0),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Service().process() should be method_call
+        let method_call = callers
+            .iter()
+            .find(|c| c.text.contains("Service().process()"));
+        assert!(method_call.is_some(), "Expected method call site");
+        assert_eq!(
+            method_call.unwrap().call_form.as_deref(),
+            Some("method_call")
+        );
+
+        // process() (bare) should be bare_call
+        let bare_call = callers
+            .iter()
+            .find(|c| c.call_form.as_deref() == Some("bare_call"));
+        assert!(
+            bare_call.is_some(),
+            "Expected bare call site, got {:?}",
+            callers
+        );
+    }
+
+    #[test]
+    fn test_find_callers_call_form_function_call() {
+        let source = r#"
+def helper(x):
+    return x
+
+def main():
+    helper(1)
+    helper(2)
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        let helper = symbol_table
+            .find_by_file_and_name("main.py", "helper")
+            .into_iter()
+            .next()
+            .expect("Expected helper function");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &helper.name,
+            &helper.file,
+            50,
+            Some(helper.line_range.0),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(callers.len(), 2);
+        for c in &callers {
+            assert_eq!(
+                c.call_form.as_deref(),
+                Some("function_call"),
+                "Free function callers should have call_form='function_call': {:?}",
+                c
+            );
+        }
+    }
+
+    // ── Context lines ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_find_callers_context_populated() {
+        let source = r#"
+class Svc:
+    def act(self):
+        pass
+
+def caller():
+    s = Svc()
+    s.act()
+    print("done")
+"#;
+        let (dir, file_tree, symbol_table) = index_python_project(&[("main.py", source)]);
+
+        let act = find_method(&symbol_table, "main.py", "act", "Svc");
+        let callers = find_callers(
+            dir.path(),
+            &file_tree,
+            &symbol_table,
+            &act.name,
+            &act.file,
+            50,
+            Some(act.line_range.0),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!callers.is_empty(), "Expected at least 1 caller");
+        let c = &callers[0];
+        assert!(c.context.is_some(), "context should be populated");
+        assert!(
+            c.context_start_line.is_some(),
+            "context_start_line should be populated"
+        );
+        let ctx = c.context.as_ref().unwrap();
+        // Context should include the call line
+        assert!(
+            ctx.contains("s.act()"),
+            "Context should contain the call: {}",
+            ctx
+        );
+        // Context should be multi-line (at least 3 lines)
+        assert!(
+            ctx.lines().count() >= 3,
+            "Context should be at least 3 lines, got: {}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn test_extract_context_boundaries() {
+        // Line 1 — context should not go below line 1
+        let source = "first\nsecond\nthird\nfourth\nfifth";
+        let (ctx, start) = extract_context(source, 1);
+        assert_eq!(start, 1);
+        assert!(ctx.contains("first"));
+        assert!(ctx.contains("third")); // 2 lines after
+
+        // Last line — context should not go past end
+        let (ctx, start) = extract_context(source, 5);
+        assert_eq!(start, 3); // 2 lines before line 5
+        assert!(ctx.contains("fifth"));
+        assert!(ctx.contains("third"));
     }
 }

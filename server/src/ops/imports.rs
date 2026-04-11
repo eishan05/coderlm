@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::symbols::ImportTable;
 
@@ -29,8 +29,8 @@ pub fn get_imports(
 
 /// Find files that depend on / import a given module.
 ///
-/// In addition to the original substring match on the raw file path, this also
-/// converts the file path to language-specific module paths so that e.g.
+/// In addition to the original substring match on the raw query, this also
+/// converts file-like paths to language-specific module paths so that e.g.
 /// `src/config.rs` matches the Rust import source `crate::config`, or
 /// `src/utils/helpers.py` matches the Python import `utils.helpers`.
 pub fn get_dependents(import_table: &ImportTable, file: &str) -> Result<Value, String> {
@@ -38,10 +38,8 @@ pub fn get_dependents(import_table: &ImportTable, file: &str) -> Result<Value, S
         return Err("File path must not be empty".to_string());
     }
     // Start with the original substring-based lookup
-    let mut result_set: std::collections::HashSet<String> = import_table
-        .get_dependents(file)
-        .into_iter()
-        .collect();
+    let mut result_set: std::collections::HashSet<String> =
+        import_table.get_dependents(file).into_iter().collect();
 
     // Generate alternative module path forms from the file path and search those too
     let module_paths = file_to_module_paths(file);
@@ -69,6 +67,7 @@ pub fn get_dependents(import_table: &ImportTable, file: &str) -> Result<Value, S
 /// - `src/server/state.rs` -> `["crate::server::state", "server::state", "server.state"]`
 /// - `src/utils/helpers.py` -> `["utils.helpers", "utils/helpers"]`
 /// - `src/utils/__init__.py` -> `["utils"]`
+/// - `clients/clob` -> `["crate::clients::clob", "clients::clob", "clients.clob", "clients/clob"]`
 fn file_to_module_paths(file: &str) -> Vec<String> {
     let mut paths = Vec::new();
 
@@ -76,10 +75,9 @@ fn file_to_module_paths(file: &str) -> Vec<String> {
     let file = file.replace('\\', "/");
 
     // Strip file extension and handle special files
-    let (dir, stem) = if file.ends_with("/mod.rs") || file.ends_with("/__init__.py") {
+    let module_base = if file.ends_with("/mod.rs") || file.ends_with("/__init__.py") {
         // mod.rs / __init__.py -> the directory is the module
-        let dir = file.rsplitn(2, '/').nth(1).unwrap_or("");
-        (dir, "")
+        file.rsplitn(2, '/').nth(1).unwrap_or("").to_string()
     } else if let Some(without_ext) = file
         .strip_suffix(".rs")
         .or_else(|| file.strip_suffix(".py"))
@@ -93,47 +91,49 @@ fn file_to_module_paths(file: &str) -> Vec<String> {
     {
         let parts: Vec<&str> = without_ext.rsplitn(2, '/').collect();
         if parts.len() == 2 {
-            (parts[1], parts[0])
+            format!("{}/{}", parts[1], parts[0])
         } else {
-            ("", parts[0])
+            parts[0].to_string()
         }
+    } else if is_extensionless_path_query(&file) {
+        file
     } else {
         return paths;
     };
 
-    // Build the full module path (without src/ prefix)
-    let module_base = if stem.is_empty() {
-        dir.to_string()
-    } else if dir.is_empty() {
-        stem.to_string()
-    } else {
-        format!("{}/{}", dir, stem)
-    };
-
     // Strip leading `src/` if present (common Rust convention)
-    let without_src = module_base
-        .strip_prefix("src/")
-        .unwrap_or(&module_base);
+    let mut module_path = module_base.strip_prefix("src/").unwrap_or(&module_base);
+    while let Some(stripped) = module_path
+        .strip_prefix("./")
+        .or_else(|| module_path.strip_prefix("../"))
+    {
+        module_path = stripped;
+    }
 
     // Rust-style: crate::module::submodule
-    let rust_module = without_src.replace('/', "::");
+    let rust_module = module_path.replace('/', "::");
     if !rust_module.is_empty() {
         paths.push(format!("crate::{}", rust_module));
         paths.push(rust_module.clone());
     }
 
     // Python-style: module.submodule
-    let python_module = without_src.replace('/', ".");
+    let python_module = module_path.replace('/', ".");
     if !python_module.is_empty() && python_module != rust_module {
         paths.push(python_module);
     }
 
     // Also add the raw path-style without src/ (for JS/TS relative imports)
-    if !without_src.is_empty() {
-        paths.push(without_src.to_string());
+    if !module_path.is_empty() {
+        paths.push(module_path.to_string());
     }
 
     paths
+}
+
+fn is_extensionless_path_query(file: &str) -> bool {
+    let last_segment = file.rsplit('/').next().unwrap_or("");
+    file.contains('/') && !last_segment.is_empty() && !last_segment.contains('.')
 }
 
 #[cfg(test)]
@@ -147,8 +147,14 @@ mod tests {
         table.insert_file_imports(
             "src/main.py",
             vec![
-                ImportEntry { source: "os".to_string(), line: 1 },
-                ImportEntry { source: "sys".to_string(), line: 2 },
+                ImportEntry {
+                    source: "os".to_string(),
+                    line: 1,
+                },
+                ImportEntry {
+                    source: "sys".to_string(),
+                    line: 2,
+                },
             ],
         );
 
@@ -173,15 +179,24 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/a.py",
-            vec![ImportEntry { source: "utils.helpers".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "utils.helpers".to_string(),
+                line: 1,
+            }],
         );
         table.insert_file_imports(
             "src/b.py",
-            vec![ImportEntry { source: "utils.helpers".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "utils.helpers".to_string(),
+                line: 1,
+            }],
         );
         table.insert_file_imports(
             "src/c.py",
-            vec![ImportEntry { source: "other".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "other".to_string(),
+                line: 1,
+            }],
         );
 
         let result = get_dependents(&table, "utils").unwrap();
@@ -212,11 +227,17 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/server/routes.rs",
-            vec![ImportEntry { source: "crate::config".to_string(), line: 5 }],
+            vec![ImportEntry {
+                source: "crate::config".to_string(),
+                line: 5,
+            }],
         );
         table.insert_file_imports(
             "src/main.rs",
-            vec![ImportEntry { source: "crate::config".to_string(), line: 3 }],
+            vec![ImportEntry {
+                source: "crate::config".to_string(),
+                line: 3,
+            }],
         );
 
         // Query by file path should find files importing crate::config
@@ -234,13 +255,50 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/ops/content.rs",
-            vec![ImportEntry { source: "crate::server::state".to_string(), line: 2 }],
+            vec![ImportEntry {
+                source: "crate::server::state".to_string(),
+                line: 2,
+            }],
         );
 
         let result = get_dependents(&table, "src/server/state.rs").unwrap();
         assert_eq!(result["count"], 1);
         let deps = result["dependents"].as_array().unwrap();
         assert_eq!(deps[0].as_str().unwrap(), "src/ops/content.rs");
+    }
+
+    #[test]
+    fn test_get_dependents_extensionless_slash_query_matches_dotted_import() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/market.py",
+            vec![ImportEntry {
+                source: "xanbot_polymarket.clients.clob".to_string(),
+                line: 1,
+            }],
+        );
+
+        let result = get_dependents(&table, "clients/clob").unwrap();
+        assert_eq!(result["count"], 1);
+        let deps = result["dependents"].as_array().unwrap();
+        assert_eq!(deps[0].as_str().unwrap(), "src/market.py");
+    }
+
+    #[test]
+    fn test_get_dependents_relative_slash_query_matches_normalized_import() {
+        let table = ImportTable::new();
+        table.insert_file_imports(
+            "src/main.py",
+            vec![ImportEntry {
+                source: "utils".to_string(),
+                line: 1,
+            }],
+        );
+
+        let result = get_dependents(&table, "./utils").unwrap();
+        assert_eq!(result["count"], 1);
+        let deps = result["dependents"].as_array().unwrap();
+        assert_eq!(deps[0].as_str().unwrap(), "src/main.py");
     }
 
     #[test]

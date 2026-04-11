@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::StreamingIterator;
 use tracing::{debug, warn};
+use tree_sitter::StreamingIterator;
 
 use crate::index::file_entry::Language;
 use crate::index::file_tree::FileTree;
@@ -96,7 +96,11 @@ fn collect_preceding_comments(
     // Walk backwards through previous siblings
     while let Some(prev) = current.prev_sibling() {
         let kind = prev.kind();
-        let text = prev.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+        let text = prev
+            .utf8_text(source.as_bytes())
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         // Compute the effective "last content row" of the previous node.
         // tree-sitter's end_position points past the last byte; when
@@ -140,9 +144,7 @@ fn collect_preceding_comments(
                 }
             }
             // Java/Scala block comments (Javadoc-style)
-            "block_comment"
-                if language == Language::Java || language == Language::Scala =>
-            {
+            "block_comment" if language == Language::Java || language == Language::Scala => {
                 if text.starts_with("/**") {
                     comments.push(text);
                     next_row = prev.start_position().row;
@@ -151,15 +153,11 @@ fn collect_preceding_comments(
                 }
             }
             // Java/Scala line comments are NOT doc comments
-            "line_comment"
-                if language == Language::Java || language == Language::Scala =>
-            {
+            "line_comment" if language == Language::Java || language == Language::Scala => {
                 break;
             }
             // TypeScript/JavaScript block comments (JSDoc-style)
-            "comment"
-                if language == Language::TypeScript || language == Language::JavaScript =>
-            {
+            "comment" if language == Language::TypeScript || language == Language::JavaScript => {
                 if text.starts_with("/**") {
                     comments.push(text);
                     next_row = prev.start_position().row;
@@ -211,13 +209,12 @@ fn collect_preceding_comments(
 /// `function_definition` or `class_definition`, where the expression is a
 /// `string` node. We accept any triple-quoted string (including prefixed
 /// variants like `r"""..."""`, `u'''...'''`, etc.) per PEP 257.
-fn extract_python_docstring(
-    identity_node: tree_sitter::Node,
-    source: &str,
-) -> Option<String> {
+fn extract_python_docstring(identity_node: tree_sitter::Node, source: &str) -> Option<String> {
     // Find the body node
     let mut cursor = identity_node.walk();
-    let body = identity_node.children(&mut cursor).find(|c| c.kind() == "block")?;
+    let body = identity_node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "block")?;
 
     // Find the first expression_statement child of the body
     let mut body_cursor = body.walk();
@@ -302,7 +299,11 @@ fn extract_symbols_from_source(
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
-    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+    let capture_names: Vec<String> = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let mut symbols = Vec::new();
     let mut current_impl_type: Option<String> = None;
@@ -632,10 +633,12 @@ pub fn extract_imports_from_source(
     let mut cursor = tree_sitter::QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
-    let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
-    let source_idx = capture_names
+    let capture_names: Vec<String> = query
+        .capture_names()
         .iter()
-        .position(|n| n == "import.source");
+        .map(|s| s.to_string())
+        .collect();
+    let source_idx = capture_names.iter().position(|n| n == "import.source");
 
     let mut imports = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -726,14 +729,22 @@ pub async fn extract_all_symbols_cached(
         for (rel_path, language) in paths {
             // Try cache first: extract mtime+size from file tree entry
             // (drop the DashMap guard before taking any write locks)
-            let file_meta = file_tree.files.get(&rel_path)
+            let file_meta = file_tree
+                .files
+                .get(&rel_path)
                 .map(|entry| (entry.modified.timestamp_millis(), entry.size as i64));
 
             if let (Some(cache), Some((mtime, file_size))) = (&cache, file_meta) {
-                if let Ok(true) = cache.is_file_unchanged(&workspace_id, &rel_path, mtime, file_size) {
+                if let Ok(true) =
+                    cache.is_file_unchanged(&workspace_id, &rel_path, mtime, file_size)
+                {
                     // mtime+size match — try to load from content hash
-                    if let Ok(Some(manifest_entry)) = cache.get_manifest_entry(&workspace_id, &rel_path) {
-                        if let Ok(Some(symbols)) = cache.lookup_symbols(&manifest_entry.content_hash, language) {
+                    if let Ok(Some(manifest_entry)) =
+                        cache.get_manifest_entry(&workspace_id, &rel_path)
+                    {
+                        if let Ok(Some(symbols)) =
+                            cache.lookup_symbols(&manifest_entry.content_hash, language)
+                        {
                             let count = symbols.len();
                             for mut sym in symbols {
                                 // Fix file path: cached symbols may have been
@@ -745,7 +756,9 @@ pub async fn extract_all_symbols_cached(
                                 fe.symbols_extracted = true;
                             }
                             // Extract imports even on cache hit (imports aren't cached)
-                            if let Ok(imports) = extract_imports_from_file(&root, &rel_path, language) {
+                            if let Ok(imports) =
+                                extract_imports_from_file(&root, &rel_path, language)
+                            {
                                 if !imports.is_empty() {
                                     import_table.insert_file_imports(&rel_path, imports);
                                 }
@@ -765,8 +778,7 @@ pub async fn extract_all_symbols_cached(
                 extract_symbols_from_file_with_hash(&root, &rel_path, language)
                     .map(|(syms, hash)| (syms, Some(hash)))
             } else {
-                extract_symbols_from_file(&root, &rel_path, language)
-                    .map(|syms| (syms, None))
+                extract_symbols_from_file(&root, &rel_path, language).map(|syms| (syms, None))
             };
 
             match extraction_result {
@@ -777,7 +789,9 @@ pub async fn extract_all_symbols_cached(
                     if let (Some(cache), Some(content_hash)) = (&cache, &content_hash) {
                         let _ = cache.store_symbols(content_hash, language, &symbols);
                         // Extract mtime+size before dropping the guard
-                        let file_meta = file_tree.files.get(&rel_path)
+                        let file_meta = file_tree
+                            .files
+                            .get(&rel_path)
                             .map(|entry| (entry.modified.timestamp_millis(), entry.size as i64));
                         if let Some((mtime, file_size)) = file_meta {
                             let _ = cache.update_manifest(
@@ -884,7 +898,9 @@ public class Greeter {
 }
 "#;
         let symbols = extract_from_source(source, Language::Java);
-        let ctor_sym = symbols.iter().find(|s| s.name == "Greeter" && s.kind == SymbolKind::Method);
+        let ctor_sym = symbols
+            .iter()
+            .find(|s| s.name == "Greeter" && s.kind == SymbolKind::Method);
         assert!(
             ctor_sym.is_some(),
             "Expected to find a constructor named 'Greeter' with SymbolKind::Method"
@@ -900,13 +916,19 @@ public class Foo {
 }
 "#;
         let symbols = extract_from_source(source, Language::Java);
-        let class_sym = symbols.iter().find(|s| s.name == "Foo" && s.kind == SymbolKind::Class);
+        let class_sym = symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.kind == SymbolKind::Class);
         assert!(class_sym.is_some(), "Expected class Foo");
 
-        let method_bar = symbols.iter().find(|s| s.name == "bar" && s.kind == SymbolKind::Method);
+        let method_bar = symbols
+            .iter()
+            .find(|s| s.name == "bar" && s.kind == SymbolKind::Method);
         assert!(method_bar.is_some(), "Expected method bar");
 
-        let method_baz = symbols.iter().find(|s| s.name == "baz" && s.kind == SymbolKind::Method);
+        let method_baz = symbols
+            .iter()
+            .find(|s| s.name == "baz" && s.kind == SymbolKind::Method);
         assert!(method_baz.is_some(), "Expected method baz");
     }
 
@@ -926,7 +948,9 @@ public record Person(String name, int age) {
         let symbols = extract_from_source(source, Language::Java);
 
         // The record itself
-        let record = symbols.iter().find(|s| s.name == "Person" && s.kind == SymbolKind::Class);
+        let record = symbols
+            .iter()
+            .find(|s| s.name == "Person" && s.kind == SymbolKind::Class);
         assert!(record.is_some(), "Expected record Person as Class");
 
         // The compact constructor (record-style, no parameter list)
@@ -940,7 +964,9 @@ public record Person(String name, int age) {
         );
 
         // The method inside the record
-        let method = symbols.iter().find(|s| s.name == "greeting" && s.kind == SymbolKind::Method);
+        let method = symbols
+            .iter()
+            .find(|s| s.name == "greeting" && s.kind == SymbolKind::Method);
         assert!(method.is_some(), "Expected method greeting");
     }
 
@@ -1019,7 +1045,9 @@ object GreeterApp {
 "#;
         let symbols = extract_from_source(source, Language::Scala);
 
-        let trait_sym = symbols.iter().find(|s| s.name == "Greeter" && s.kind == SymbolKind::Trait);
+        let trait_sym = symbols
+            .iter()
+            .find(|s| s.name == "Greeter" && s.kind == SymbolKind::Trait);
         assert!(trait_sym.is_some(), "Expected trait Greeter");
 
         let class_sym = symbols
@@ -1062,7 +1090,11 @@ object Point {
             .iter()
             .filter(|s| s.name == "Point" && s.kind == SymbolKind::Module)
             .collect();
-        assert_eq!(objects.len(), 1, "Expected exactly one object Point as Module");
+        assert_eq!(
+            objects.len(),
+            1,
+            "Expected exactly one object Point as Module"
+        );
 
         // They must have different line ranges
         assert_ne!(
@@ -1220,7 +1252,10 @@ ANOTHER_CONST = True
         let handle_method = symbols
             .iter()
             .find(|s| s.name == "handle" && s.kind == SymbolKind::Method);
-        assert!(handle_method.is_some(), "Expected method handle from class Handler");
+        assert!(
+            handle_method.is_some(),
+            "Expected method handle from class Handler"
+        );
 
         // Methods inside classes should NOT also appear as Function symbols
         let handle_func = symbols
@@ -1373,7 +1408,12 @@ def from_dict(cls, data):
             .iter()
             .filter(|s| s.name == "name" && s.kind == SymbolKind::Function)
             .collect();
-        assert_eq!(name_fns.len(), 1, "Expected exactly one symbol for 'name', got {}", name_fns.len());
+        assert_eq!(
+            name_fns.len(),
+            1,
+            "Expected exactly one symbol for 'name', got {}",
+            name_fns.len()
+        );
         let name_fn = name_fns[0];
         assert!(
             name_fn.decorators.contains(&"@property".to_string()),
@@ -1396,7 +1436,11 @@ def from_dict(cls, data):
             .iter()
             .filter(|s| s.name == "create" && s.kind == SymbolKind::Function)
             .collect();
-        assert_eq!(create_fns.len(), 1, "Expected exactly one symbol for 'create'");
+        assert_eq!(
+            create_fns.len(),
+            1,
+            "Expected exactly one symbol for 'create'"
+        );
         let create_fn = create_fns[0];
         assert!(
             create_fn.decorators.contains(&"@staticmethod".to_string()),
@@ -1413,10 +1457,16 @@ def from_dict(cls, data):
             .iter()
             .filter(|s| s.name == "from_dict" && s.kind == SymbolKind::Function)
             .collect();
-        assert_eq!(from_dict_fns.len(), 1, "Expected exactly one symbol for 'from_dict'");
+        assert_eq!(
+            from_dict_fns.len(),
+            1,
+            "Expected exactly one symbol for 'from_dict'"
+        );
         let from_dict_fn = from_dict_fns[0];
         assert!(
-            from_dict_fn.decorators.contains(&"@classmethod".to_string()),
+            from_dict_fn
+                .decorators
+                .contains(&"@classmethod".to_string()),
             "Expected @classmethod decorator on 'from_dict', got: {:?}",
             from_dict_fn.decorators
         );
@@ -1622,9 +1672,7 @@ class DryRunBroker:
             let m = symbols
                 .iter()
                 .find(|s| s.kind == SymbolKind::Method && s.name == *name)
-                .unwrap_or_else(|| {
-                    panic!("Expected method '{}' for real-shaped broker", name)
-                });
+                .unwrap_or_else(|| panic!("Expected method '{}' for real-shaped broker", name));
             assert_eq!(
                 m.parent.as_deref(),
                 Some("DryRunBroker"),
@@ -1830,7 +1878,8 @@ def admin_dashboard():
             .filter(|s| s.name == "admin_dashboard" && s.kind == SymbolKind::Function)
             .collect();
         assert_eq!(
-            dashboards.len(), 1,
+            dashboards.len(),
+            1,
             "Expected exactly one symbol for 'admin_dashboard', got {}",
             dashboards.len()
         );
@@ -1842,17 +1891,16 @@ def admin_dashboard():
             dashboard.decorators
         );
         assert!(
-            dashboard.decorators.contains(&"@login_required".to_string()),
+            dashboard
+                .decorators
+                .contains(&"@login_required".to_string()),
             "Expected @login_required"
         );
         assert!(
             dashboard.decorators.contains(&"@admin_only".to_string()),
             "Expected @admin_only"
         );
-        let has_cache = dashboard
-            .decorators
-            .iter()
-            .any(|d| d.starts_with("@cache"));
+        let has_cache = dashboard.decorators.iter().any(|d| d.starts_with("@cache"));
         assert!(has_cache, "Expected @cache decorator");
         // Signature should be the def line (line 5), not any decorator line
         assert!(
@@ -1911,11 +1959,7 @@ class Config:
             .collect();
         assert_eq!(configs.len(), 1, "Expected exactly one symbol for 'Config'");
         let config = configs[0];
-        assert_eq!(
-            config.decorators.len(),
-            1,
-            "Expected 1 decorator on Config"
-        );
+        assert_eq!(config.decorators.len(), 1, "Expected 1 decorator on Config");
         assert!(
             config.decorators[0].starts_with("@dataclass"),
             "Expected @dataclass decorator on Config, got: {}",
@@ -1994,7 +2038,10 @@ impl Foo {
             signature: "def my_route():".to_string(),
             definition: None,
             parent: None,
-            decorators: vec!["@app.route(\"/api/test\")".to_string(), "@login_required".to_string()],
+            decorators: vec![
+                "@app.route(\"/api/test\")".to_string(),
+                "@login_required".to_string(),
+            ],
             doc_comment: None,
         };
 
@@ -2398,14 +2445,21 @@ const (
             .unwrap();
 
         // Should have extracted symbols only from normal.rs (hello, world)
-        assert!(count >= 2, "Expected at least 2 symbols from normal.rs, got {}", count);
+        assert!(
+            count >= 2,
+            "Expected at least 2 symbols from normal.rs, got {}",
+            count
+        );
 
         // Symbols from oversized.rs should not exist
         let oversized_symbols = symbol_table.list_by_file("oversized.rs");
         assert!(
             oversized_symbols.is_empty(),
             "Oversized file should not have symbols extracted, but found: {:?}",
-            oversized_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            oversized_symbols
+                .iter()
+                .map(|s| &s.name)
+                .collect::<Vec<_>>()
         );
 
         // Symbols from normal.rs should exist
@@ -2425,7 +2479,11 @@ const (
 
         // Create a Rust file
         let file_path = root.join("lib.rs");
-        std::fs::write(&file_path, "pub fn cached_func() {}\npub fn other_func() {}").unwrap();
+        std::fs::write(
+            &file_path,
+            "pub fn cached_func() {}\npub fn other_func() {}",
+        )
+        .unwrap();
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
@@ -2439,8 +2497,20 @@ const (
         let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
 
         // First extraction - cache miss, should populate cache
-        let count = extract_all_symbols_cached(&root, &file_tree, &symbol_table, &import_table, Some(&cache)).await.unwrap();
-        assert!(count >= 2, "Should extract at least 2 symbols, got {}", count);
+        let count = extract_all_symbols_cached(
+            &root,
+            &file_tree,
+            &symbol_table,
+            &import_table,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert!(
+            count >= 2,
+            "Should extract at least 2 symbols, got {}",
+            count
+        );
 
         // Verify symbols in table
         let syms = symbol_table.list_by_file("lib.rs");
@@ -2449,7 +2519,10 @@ const (
         // Verify cache was populated
         let workspace_id = root.to_string_lossy().to_string();
         let manifest = cache.get_workspace_manifest(&workspace_id).unwrap();
-        assert!(!manifest.is_empty(), "Manifest should have entries after extraction");
+        assert!(
+            !manifest.is_empty(),
+            "Manifest should have entries after extraction"
+        );
     }
 
     #[tokio::test]
@@ -2472,13 +2545,24 @@ const (
         let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
 
         // First extraction populates cache
-        let count1 = extract_all_symbols_cached(&root, &file_tree, &symbol_table, &import_table, Some(&cache)).await.unwrap();
+        let count1 = extract_all_symbols_cached(
+            &root,
+            &file_tree,
+            &symbol_table,
+            &import_table,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
         assert!(count1 >= 1);
 
         // Verify cache was actually populated
         let workspace_id = root.to_string_lossy().to_string();
         let manifest = cache.get_workspace_manifest(&workspace_id).unwrap();
-        assert!(!manifest.is_empty(), "Cache should be populated after first run");
+        assert!(
+            !manifest.is_empty(),
+            "Cache should be populated after first run"
+        );
 
         // Now create fresh in-memory state (simulating server restart)
         // but re-scan same directory so file entries have same mtime+size
@@ -2487,10 +2571,21 @@ const (
         let import_table2 = Arc::new(ImportTable::new());
         crate::index::walker::scan_directory(&root, &file_tree2, 10_000_000).unwrap();
 
-        assert!(symbol_table2.list_by_file("lib.rs").is_empty(), "Fresh symbol table should be empty");
+        assert!(
+            symbol_table2.list_by_file("lib.rs").is_empty(),
+            "Fresh symbol table should be empty"
+        );
 
         // Second extraction should use cache (same mtime+size since file unchanged)
-        let count2 = extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, &import_table2, Some(&cache)).await.unwrap();
+        let count2 = extract_all_symbols_cached(
+            &root,
+            &file_tree2,
+            &symbol_table2,
+            &import_table2,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
         assert_eq!(count1, count2, "Cache hit should produce same symbol count");
 
         let syms = symbol_table2.list_by_file("lib.rs");
@@ -2517,7 +2612,15 @@ const (
         let cache = Arc::new(CacheStore::open(&cache_dir.path().join("cache.db")).unwrap());
 
         // First extraction
-        extract_all_symbols_cached(&root, &file_tree, &symbol_table, &import_table, Some(&cache)).await.unwrap();
+        extract_all_symbols_cached(
+            &root,
+            &file_tree,
+            &symbol_table,
+            &import_table,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
 
         // Modify the file (changes size, which makes cache miss)
         std::fs::write(&file_path, "pub fn replaced_function_with_longer_name() {}").unwrap();
@@ -2529,7 +2632,15 @@ const (
         crate::index::walker::scan_directory(&root, &file_tree2, 10_000_000).unwrap();
 
         // Second extraction should detect change and re-extract
-        extract_all_symbols_cached(&root, &file_tree2, &symbol_table2, &import_table2, Some(&cache)).await.unwrap();
+        extract_all_symbols_cached(
+            &root,
+            &file_tree2,
+            &symbol_table2,
+            &import_table2,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
 
         let syms = symbol_table2.list_by_file("lib.rs");
         assert!(!syms.is_empty());
@@ -2586,7 +2697,10 @@ fn undocumented() {}
 fn regular_comment() {}
 "#;
         let symbols = extract_from_source(source, Language::Rust);
-        let sym = symbols.iter().find(|s| s.name == "regular_comment").unwrap();
+        let sym = symbols
+            .iter()
+            .find(|s| s.name == "regular_comment")
+            .unwrap();
         assert!(
             sym.doc_comment.is_none(),
             "Regular // comments should NOT be captured as doc comments"
@@ -2600,7 +2714,10 @@ fn regular_comment() {}
 fn block_documented() {}
 "#;
         let symbols = extract_from_source(source, Language::Rust);
-        let sym = symbols.iter().find(|s| s.name == "block_documented").unwrap();
+        let sym = symbols
+            .iter()
+            .find(|s| s.name == "block_documented")
+            .unwrap();
         assert!(
             sym.doc_comment.is_some(),
             "Expected doc_comment for block-style doc comment"
@@ -2669,7 +2786,10 @@ class MyClass:
         pass
 "#;
         let symbols = extract_from_source(source, Language::Python);
-        let cls = symbols.iter().find(|s| s.name == "MyClass" && s.kind == SymbolKind::Class).unwrap();
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "MyClass" && s.kind == SymbolKind::Class)
+            .unwrap();
         assert!(
             cls.doc_comment.is_some(),
             "Expected doc_comment for class 'MyClass'"
@@ -2709,7 +2829,10 @@ def single_quoted():
             "Expected doc_comment for single-quoted docstring"
         );
         assert!(
-            sym.doc_comment.as_ref().unwrap().contains("Single-quoted docstring"),
+            sym.doc_comment
+                .as_ref()
+                .unwrap()
+                .contains("Single-quoted docstring"),
             "Should capture single-quoted docstrings"
         );
     }
@@ -2733,7 +2856,10 @@ public class StringUtils {
 "#;
         let symbols = extract_from_source(source, Language::Java);
 
-        let cls = symbols.iter().find(|s| s.name == "StringUtils" && s.kind == SymbolKind::Class).unwrap();
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "StringUtils" && s.kind == SymbolKind::Class)
+            .unwrap();
         assert!(
             cls.doc_comment.is_some(),
             "Expected doc_comment for class 'StringUtils'"
@@ -2743,13 +2869,20 @@ public class StringUtils {
             "Class doc comment should contain 'utility class'"
         );
 
-        let method = symbols.iter().find(|s| s.name == "reverse" && s.kind == SymbolKind::Method).unwrap();
+        let method = symbols
+            .iter()
+            .find(|s| s.name == "reverse" && s.kind == SymbolKind::Method)
+            .unwrap();
         assert!(
             method.doc_comment.is_some(),
             "Expected doc_comment for method 'reverse'"
         );
         assert!(
-            method.doc_comment.as_ref().unwrap().contains("Reverses a string"),
+            method
+                .doc_comment
+                .as_ref()
+                .unwrap()
+                .contains("Reverses a string"),
             "Method doc comment should contain 'Reverses a string'"
         );
     }
@@ -2786,10 +2919,7 @@ func Undocumented() {}
         let symbols = extract_from_source(source, Language::Go);
 
         let add = symbols.iter().find(|s| s.name == "Add").unwrap();
-        assert!(
-            add.doc_comment.is_some(),
-            "Expected doc_comment for 'Add'"
-        );
+        assert!(add.doc_comment.is_some(), "Expected doc_comment for 'Add'");
         let comment = add.doc_comment.as_ref().unwrap();
         assert!(
             comment.contains("returns the sum"),
@@ -2822,10 +2952,7 @@ function plain() {}
         let symbols = extract_from_source(source, Language::TypeScript);
 
         let add = symbols.iter().find(|s| s.name == "add").unwrap();
-        assert!(
-            add.doc_comment.is_some(),
-            "Expected doc_comment for 'add'"
-        );
+        assert!(add.doc_comment.is_some(), "Expected doc_comment for 'add'");
         let comment = add.doc_comment.as_ref().unwrap();
         assert!(
             comment.contains("Adds two numbers"),
@@ -2859,7 +2986,10 @@ function greet(name) {
             "Expected doc_comment for 'greet'"
         );
         assert!(
-            sym.doc_comment.as_ref().unwrap().contains("Formats a greeting"),
+            sym.doc_comment
+                .as_ref()
+                .unwrap()
+                .contains("Formats a greeting"),
             "Doc comment should contain 'Formats a greeting'"
         );
     }
@@ -2877,13 +3007,19 @@ class Person(val name: String, val age: Int)
 def helper(): Unit = {}
 "#;
         let symbols = extract_from_source(source, Language::Scala);
-        let cls = symbols.iter().find(|s| s.name == "Person" && s.kind == SymbolKind::Class).unwrap();
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "Person" && s.kind == SymbolKind::Class)
+            .unwrap();
         assert!(
             cls.doc_comment.is_some(),
             "Expected doc_comment for class 'Person'"
         );
         assert!(
-            cls.doc_comment.as_ref().unwrap().contains("case class representing"),
+            cls.doc_comment
+                .as_ref()
+                .unwrap()
+                .contains("case class representing"),
             "Scaladoc should contain 'case class representing'"
         );
     }
@@ -2962,7 +3098,10 @@ struct Config {
             "Expected doc_comment for 'Config' even with #[derive(...)] attribute"
         );
         assert!(
-            sym.doc_comment.as_ref().unwrap().contains("configuration struct"),
+            sym.doc_comment
+                .as_ref()
+                .unwrap()
+                .contains("configuration struct"),
             "Doc comment should contain 'configuration struct'"
         );
     }
@@ -2982,7 +3121,10 @@ def api_handler():
             "Expected doc_comment for decorated function with docstring"
         );
         assert!(
-            sym.doc_comment.as_ref().unwrap().contains("Handle API requests"),
+            sym.doc_comment
+                .as_ref()
+                .unwrap()
+                .contains("Handle API requests"),
             "Docstring should contain 'Handle API requests'"
         );
     }
@@ -3000,7 +3142,10 @@ def api_handler():
 fn module_function() {}
 "#;
         let symbols = extract_from_source(source, Language::Rust);
-        let sym = symbols.iter().find(|s| s.name == "module_function").unwrap();
+        let sym = symbols
+            .iter()
+            .find(|s| s.name == "module_function")
+            .unwrap();
         assert!(
             sym.doc_comment.is_none(),
             "Rust //! inner doc comments should NOT be attached to the following symbol"
@@ -3015,7 +3160,10 @@ fn module_function() {}
 fn after_inner_block() {}
 "#;
         let symbols = extract_from_source(source, Language::Rust);
-        let sym = symbols.iter().find(|s| s.name == "after_inner_block").unwrap();
+        let sym = symbols
+            .iter()
+            .find(|s| s.name == "after_inner_block")
+            .unwrap();
         assert!(
             sym.doc_comment.is_none(),
             "Rust /*! */ inner doc comments should NOT be attached to the following symbol"
@@ -3143,7 +3291,10 @@ func Important() {}
 fn orphaned_comment() {}
 "#;
         let symbols = extract_from_source(source, Language::Rust);
-        let sym = symbols.iter().find(|s| s.name == "orphaned_comment").unwrap();
+        let sym = symbols
+            .iter()
+            .find(|s| s.name == "orphaned_comment")
+            .unwrap();
         assert!(
             sym.doc_comment.is_none(),
             "Doc comment separated by a blank line should NOT be attached to the symbol"
@@ -3197,10 +3348,26 @@ from collections import OrderedDict
 "#;
         let imports = extract_imports_from_source(source, "test.py", Language::Python).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
-        assert!(sources.contains(&"os"), "Expected 'os' in imports, got: {:?}", sources);
-        assert!(sources.contains(&"sys"), "Expected 'sys' in imports, got: {:?}", sources);
-        assert!(sources.contains(&"pathlib"), "Expected 'pathlib' in imports, got: {:?}", sources);
-        assert!(sources.contains(&"collections"), "Expected 'collections' in imports, got: {:?}", sources);
+        assert!(
+            sources.contains(&"os"),
+            "Expected 'os' in imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"sys"),
+            "Expected 'sys' in imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"pathlib"),
+            "Expected 'pathlib' in imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"collections"),
+            "Expected 'collections' in imports, got: {:?}",
+            sources
+        );
     }
 
     #[test]
@@ -3213,26 +3380,33 @@ use crate::config;
 "#;
         let imports = extract_imports_from_source(source, "test.rs", Language::Rust).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
-        assert!(!imports.is_empty(), "Expected imports from Rust use declarations");
+        assert!(
+            !imports.is_empty(),
+            "Expected imports from Rust use declarations"
+        );
         // 3-segment: std::collections::HashMap -> captures path "std::collections"
         assert!(
             sources.iter().any(|s| s.contains("std")),
-            "Expected 'std' in Rust imports, got: {:?}", sources
+            "Expected 'std' in Rust imports, got: {:?}",
+            sources
         );
         // 2-segment with crate keyword: use crate::config -> captures "crate::config"
         assert!(
             sources.contains(&"crate::config"),
-            "Expected 'crate::config' in Rust imports, got: {:?}", sources
+            "Expected 'crate::config' in Rust imports, got: {:?}",
+            sources
         );
         // 2-segment with identifier: use anyhow::Result -> captures "anyhow::Result"
         assert!(
             sources.contains(&"anyhow::Result"),
-            "Expected 'anyhow::Result' in Rust imports, got: {:?}", sources
+            "Expected 'anyhow::Result' in Rust imports, got: {:?}",
+            sources
         );
         // 3-segment: use crate::index::file_entry::Language -> captures "crate::index::file_entry"
         assert!(
             sources.contains(&"crate::index::file_entry"),
-            "Expected 'crate::index::file_entry' in Rust imports, got: {:?}", sources
+            "Expected 'crate::index::file_entry' in Rust imports, got: {:?}",
+            sources
         );
     }
 
@@ -3245,9 +3419,21 @@ import { Router } from './router';
 "#;
         let imports = extract_imports_from_source(source, "test.ts", Language::TypeScript).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
-        assert!(sources.contains(&"react"), "Expected 'react' in imports, got: {:?}", sources);
-        assert!(sources.contains(&"axios"), "Expected 'axios' in imports, got: {:?}", sources);
-        assert!(sources.contains(&"./router"), "Expected './router' in imports, got: {:?}", sources);
+        assert!(
+            sources.contains(&"react"),
+            "Expected 'react' in imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"axios"),
+            "Expected 'axios' in imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"./router"),
+            "Expected './router' in imports, got: {:?}",
+            sources
+        );
     }
 
     #[test]
@@ -3258,8 +3444,16 @@ import { join } from 'path';
 "#;
         let imports = extract_imports_from_source(source, "test.js", Language::JavaScript).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
-        assert!(sources.contains(&"express"), "Expected 'express' in JS imports, got: {:?}", sources);
-        assert!(sources.contains(&"path"), "Expected 'path' in JS imports, got: {:?}", sources);
+        assert!(
+            sources.contains(&"express"),
+            "Expected 'express' in JS imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"path"),
+            "Expected 'path' in JS imports, got: {:?}",
+            sources
+        );
     }
 
     #[test]
@@ -3275,9 +3469,21 @@ import (
 "#;
         let imports = extract_imports_from_source(source, "test.go", Language::Go).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
-        assert!(sources.contains(&"fmt"), "Expected 'fmt' in Go imports, got: {:?}", sources);
-        assert!(sources.contains(&"os"), "Expected 'os' in Go imports, got: {:?}", sources);
-        assert!(sources.contains(&"net/http"), "Expected 'net/http' in Go imports, got: {:?}", sources);
+        assert!(
+            sources.contains(&"fmt"),
+            "Expected 'fmt' in Go imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"os"),
+            "Expected 'os' in Go imports, got: {:?}",
+            sources
+        );
+        assert!(
+            sources.contains(&"net/http"),
+            "Expected 'net/http' in Go imports, got: {:?}",
+            sources
+        );
     }
 
     #[test]
@@ -3289,10 +3495,14 @@ import org.junit.Test;
 "#;
         let imports = extract_imports_from_source(source, "Test.java", Language::Java).unwrap();
         let sources: Vec<&str> = imports.iter().map(|i| i.source.as_str()).collect();
-        assert!(!imports.is_empty(), "Expected imports from Java import declarations");
+        assert!(
+            !imports.is_empty(),
+            "Expected imports from Java import declarations"
+        );
         assert!(
             sources.iter().any(|s| s.contains("java.util")),
-            "Expected 'java.util' in Java imports, got: {:?}", sources
+            "Expected 'java.util' in Java imports, got: {:?}",
+            sources
         );
     }
 

@@ -97,8 +97,8 @@ pub fn load_annotations(
 
     let json = std::fs::read_to_string(&annotations_path)
         .map_err(|e| format!("Failed to read annotations: {}", e))?;
-    let data: AnnotationData = serde_json::from_str(&json)
-        .map_err(|e| format!("Failed to parse annotations: {}", e))?;
+    let data: AnnotationData =
+        serde_json::from_str(&json).map_err(|e| format!("Failed to parse annotations: {}", e))?;
 
     // Apply file definitions
     for (path, def) in &data.file_definitions {

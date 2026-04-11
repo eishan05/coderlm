@@ -165,13 +165,21 @@ mod tests {
     use tree_sitter::StreamingIterator;
 
     /// Helper: run the callers query on source code and return all captured callee names.
-    fn extract_callees(source: &str, language: tree_sitter::Language, query_str: &str) -> Vec<(String, usize)> {
+    fn extract_callees(
+        source: &str,
+        language: tree_sitter::Language,
+        query_str: &str,
+    ) -> Vec<(String, usize)> {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
         let tree = parser.parse(source, None).unwrap();
         let query = tree_sitter::Query::new(&language, query_str).unwrap();
 
-        let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+        let capture_names: Vec<String> = query
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let callee_idx = capture_names.iter().position(|n| n == "callee").unwrap();
 
         let mut cursor = tree_sitter::QueryCursor::new();

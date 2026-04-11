@@ -74,7 +74,11 @@ impl CacheStore {
     /// Look up cached symbols by content hash + language. Returns None if:
     /// - No entry exists for this hash+language combination
     /// - The entry exists but has stale version numbers
-    pub fn lookup_symbols(&self, content_hash: &str, language: Language) -> Result<Option<Vec<Symbol>>> {
+    pub fn lookup_symbols(
+        &self,
+        content_hash: &str,
+        language: Language,
+    ) -> Result<Option<Vec<Symbol>>> {
         let lang_str = serde_json::to_string(&language)?;
         let lang_str = lang_str.trim_matches('"').to_string();
 
@@ -145,17 +149,14 @@ impl CacheStore {
              WHERE workspace_id = ?1 AND rel_path = ?2",
         )?;
 
-        let result = stmt.query_row(
-            rusqlite::params![workspace_id, rel_path],
-            |row| {
-                Ok(ManifestEntry {
-                    rel_path: row.get(0)?,
-                    content_hash: row.get(1)?,
-                    mtime: row.get(2)?,
-                    file_size: row.get(3)?,
-                })
-            },
-        );
+        let result = stmt.query_row(rusqlite::params![workspace_id, rel_path], |row| {
+            Ok(ManifestEntry {
+                rel_path: row.get(0)?,
+                content_hash: row.get(1)?,
+                mtime: row.get(2)?,
+                file_size: row.get(3)?,
+            })
+        });
 
         match result {
             Ok(entry) => Ok(Some(entry)),
@@ -325,7 +326,9 @@ mod tests {
             ],
         ).unwrap();
 
-        let loaded = store.lookup_symbols("stale_grammar", Language::Rust).unwrap();
+        let loaded = store
+            .lookup_symbols("stale_grammar", Language::Rust)
+            .unwrap();
         assert!(loaded.is_none(), "Stale grammar version should return None");
     }
 
@@ -348,7 +351,9 @@ mod tests {
             ],
         ).unwrap();
 
-        let loaded = store.lookup_symbols("stale_schema", Language::Rust).unwrap();
+        let loaded = store
+            .lookup_symbols("stale_schema", Language::Rust)
+            .unwrap();
         assert!(loaded.is_none(), "Stale schema version should return None");
     }
 
@@ -359,9 +364,13 @@ mod tests {
         let symbols2 = vec![make_test_symbol("foo", "b/main.rs", 1, Language::Rust)];
 
         // Same content hash from two different workspaces
-        store.store_symbols("shared_hash", Language::Rust, &symbols1).unwrap();
+        store
+            .store_symbols("shared_hash", Language::Rust, &symbols1)
+            .unwrap();
         // Second store with same hash should succeed (upsert / ignore)
-        store.store_symbols("shared_hash", Language::Rust, &symbols2).unwrap();
+        store
+            .store_symbols("shared_hash", Language::Rust, &symbols2)
+            .unwrap();
 
         // Should return whichever was stored (first or second, doesn't matter)
         let loaded = store.lookup_symbols("shared_hash", Language::Rust).unwrap();
@@ -390,7 +399,9 @@ mod tests {
     #[test]
     fn test_get_manifest_entry_returns_none_for_missing() {
         let store = make_test_store();
-        let entry = store.get_manifest_entry("/project", "nonexistent.rs").unwrap();
+        let entry = store
+            .get_manifest_entry("/project", "nonexistent.rs")
+            .unwrap();
         assert!(entry.is_none());
     }
 
@@ -399,10 +410,17 @@ mod tests {
         let store = make_test_store();
         let workspace = "/project";
 
-        store.update_manifest(workspace, "src/main.rs", "hash_v1", 100, 50).unwrap();
-        store.update_manifest(workspace, "src/main.rs", "hash_v2", 200, 60).unwrap();
+        store
+            .update_manifest(workspace, "src/main.rs", "hash_v1", 100, 50)
+            .unwrap();
+        store
+            .update_manifest(workspace, "src/main.rs", "hash_v2", 200, 60)
+            .unwrap();
 
-        let entry = store.get_manifest_entry(workspace, "src/main.rs").unwrap().unwrap();
+        let entry = store
+            .get_manifest_entry(workspace, "src/main.rs")
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.content_hash, "hash_v2");
         assert_eq!(entry.mtime, 200);
         assert_eq!(entry.file_size, 60);
@@ -415,9 +433,15 @@ mod tests {
         let store = make_test_store();
         let workspace = "/project";
 
-        store.update_manifest(workspace, "src/main.rs", "h1", 100, 50).unwrap();
-        store.update_manifest(workspace, "src/lib.rs", "h2", 200, 60).unwrap();
-        store.update_manifest("/other", "src/main.rs", "h3", 300, 70).unwrap();
+        store
+            .update_manifest(workspace, "src/main.rs", "h1", 100, 50)
+            .unwrap();
+        store
+            .update_manifest(workspace, "src/lib.rs", "h2", 200, 60)
+            .unwrap();
+        store
+            .update_manifest("/other", "src/main.rs", "h3", 300, 70)
+            .unwrap();
 
         let entries = store.get_workspace_manifest(workspace).unwrap();
         assert_eq!(entries.len(), 2);
@@ -428,31 +452,53 @@ mod tests {
     #[test]
     fn test_is_file_unchanged_true_when_matching() {
         let store = make_test_store();
-        store.update_manifest("/project", "src/main.rs", "hash1", 100, 50).unwrap();
+        store
+            .update_manifest("/project", "src/main.rs", "hash1", 100, 50)
+            .unwrap();
 
-        assert!(store.is_file_unchanged("/project", "src/main.rs", 100, 50).unwrap());
+        assert!(
+            store
+                .is_file_unchanged("/project", "src/main.rs", 100, 50)
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_is_file_unchanged_false_when_mtime_differs() {
         let store = make_test_store();
-        store.update_manifest("/project", "src/main.rs", "hash1", 100, 50).unwrap();
+        store
+            .update_manifest("/project", "src/main.rs", "hash1", 100, 50)
+            .unwrap();
 
-        assert!(!store.is_file_unchanged("/project", "src/main.rs", 200, 50).unwrap());
+        assert!(
+            !store
+                .is_file_unchanged("/project", "src/main.rs", 200, 50)
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_is_file_unchanged_false_when_size_differs() {
         let store = make_test_store();
-        store.update_manifest("/project", "src/main.rs", "hash1", 100, 50).unwrap();
+        store
+            .update_manifest("/project", "src/main.rs", "hash1", 100, 50)
+            .unwrap();
 
-        assert!(!store.is_file_unchanged("/project", "src/main.rs", 100, 99).unwrap());
+        assert!(
+            !store
+                .is_file_unchanged("/project", "src/main.rs", 100, 99)
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_is_file_unchanged_false_when_not_in_manifest() {
         let store = make_test_store();
-        assert!(!store.is_file_unchanged("/project", "unknown.rs", 100, 50).unwrap());
+        assert!(
+            !store
+                .is_file_unchanged("/project", "unknown.rs", 100, 50)
+                .unwrap()
+        );
     }
 
     // --- remove_manifest_entry ---
@@ -460,9 +506,13 @@ mod tests {
     #[test]
     fn test_remove_manifest_entry() {
         let store = make_test_store();
-        store.update_manifest("/project", "src/main.rs", "hash1", 100, 50).unwrap();
+        store
+            .update_manifest("/project", "src/main.rs", "hash1", 100, 50)
+            .unwrap();
 
-        store.remove_manifest_entry("/project", "src/main.rs").unwrap();
+        store
+            .remove_manifest_entry("/project", "src/main.rs")
+            .unwrap();
         let entry = store.get_manifest_entry("/project", "src/main.rs").unwrap();
         assert!(entry.is_none());
     }
@@ -472,9 +522,15 @@ mod tests {
     #[test]
     fn test_clear_workspace_removes_all_entries_for_workspace() {
         let store = make_test_store();
-        store.update_manifest("/project", "a.rs", "h1", 100, 50).unwrap();
-        store.update_manifest("/project", "b.rs", "h2", 200, 60).unwrap();
-        store.update_manifest("/other", "c.rs", "h3", 300, 70).unwrap();
+        store
+            .update_manifest("/project", "a.rs", "h1", 100, 50)
+            .unwrap();
+        store
+            .update_manifest("/project", "b.rs", "h2", 200, 60)
+            .unwrap();
+        store
+            .update_manifest("/other", "c.rs", "h3", 300, 70)
+            .unwrap();
 
         store.clear_workspace("/project").unwrap();
 
@@ -505,8 +561,13 @@ mod tests {
             doc_comment: Some("Converts x to string representation.".to_string()),
         };
 
-        store.store_symbols("roundtrip_hash", Language::Python, &[sym.clone()]).unwrap();
-        let loaded = store.lookup_symbols("roundtrip_hash", Language::Python).unwrap().unwrap();
+        store
+            .store_symbols("roundtrip_hash", Language::Python, &[sym.clone()])
+            .unwrap();
+        let loaded = store
+            .lookup_symbols("roundtrip_hash", Language::Python)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.len(), 1);
 
         let loaded = &loaded[0];

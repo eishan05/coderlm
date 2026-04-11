@@ -13,7 +13,7 @@ use crate::index::{walker, watcher};
 use crate::ops::annotations;
 use crate::server::errors::AppError;
 use crate::server::session::Session;
-use crate::symbols::{parser, ImportTable, SymbolTable};
+use crate::symbols::{ImportTable, SymbolTable, parser};
 
 /// A single indexed project with its own file tree, symbol table, and watcher.
 pub struct Project {
@@ -71,11 +71,17 @@ impl AppState {
         // Try to open the persistent cache; log and continue if it fails
         let cache = match CacheStore::open(&CacheStore::default_db_path()) {
             Ok(store) => {
-                info!("Persistent cache opened at {}", CacheStore::default_db_path().display());
+                info!(
+                    "Persistent cache opened at {}",
+                    CacheStore::default_db_path().display()
+                );
                 Some(Arc::new(store))
             }
             Err(e) => {
-                tracing::warn!("Failed to open persistent cache: {}. Proceeding without cache.", e);
+                tracing::warn!(
+                    "Failed to open persistent cache: {}. Proceeding without cache.",
+                    e
+                );
                 None
             }
         };
@@ -92,7 +98,11 @@ impl AppState {
     }
 
     /// Create AppState with an explicit cache (for testing).
-    pub fn new_with_cache(max_projects: usize, max_file_size: u64, cache: Option<Arc<CacheStore>>) -> Self {
+    pub fn new_with_cache(
+        max_projects: usize,
+        max_file_size: u64,
+        cache: Option<Arc<CacheStore>>,
+    ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 projects: DashMap::new(),
@@ -106,9 +116,9 @@ impl AppState {
 
     /// Look up an existing project or index a new one. Evicts LRU if at capacity.
     pub fn get_or_create_project(&self, cwd: &Path) -> Result<Arc<Project>, AppError> {
-        let canonical = cwd.canonicalize().map_err(|e| {
-            AppError::BadRequest(format!("Path not accessible: {}", e))
-        })?;
+        let canonical = cwd
+            .canonicalize()
+            .map_err(|e| AppError::BadRequest(format!("Path not accessible: {}", e)))?;
 
         if !canonical.is_dir() {
             return Err(AppError::BadRequest(format!(
@@ -135,9 +145,8 @@ impl AppState {
         let max_file_size = self.inner.max_file_size;
 
         info!("Indexing new project: {}", canonical.display());
-        let file_count =
-            walker::scan_directory(&canonical, &file_tree, max_file_size)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+        let file_count = walker::scan_directory(&canonical, &file_tree, max_file_size)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
         info!("Indexed {} files for {}", file_count, canonical.display());
 
         // Start watcher
@@ -182,7 +191,11 @@ impl AppState {
                     // This replaces the old racy 500ms-delayed spawn.
                     match annotations::load_annotations(&root, &ft, &st) {
                         Ok(_) => info!("Loaded annotations for {}", root.display()),
-                        Err(e) => tracing::warn!("Failed to load annotations for {}: {}", root.display(), e),
+                        Err(e) => tracing::warn!(
+                            "Failed to load annotations for {}: {}",
+                            root.display(),
+                            e
+                        ),
                     }
                 }
                 Err(e) => tracing::error!("Symbol extraction failed for {}: {}", root.display(), e),
@@ -205,17 +218,13 @@ impl AppState {
 
         let project_path = &session.project_path;
 
-        let project = self
-            .inner
-            .projects
-            .get(project_path)
-            .ok_or_else(|| {
-                AppError::Gone(format!(
-                    "Project at '{}' was evicted due to capacity limits. \
+        let project = self.inner.projects.get(project_path).ok_or_else(|| {
+            AppError::Gone(format!(
+                "Project at '{}' was evicted due to capacity limits. \
                      Start a new session to re-index, or increase --max-projects.",
-                    project_path.display()
-                ))
-            })?;
+                project_path.display()
+            ))
+        })?;
 
         Ok(project.clone())
     }
@@ -237,9 +246,7 @@ impl AppState {
             .min_by_key(|entry| *entry.value().last_active.lock())
             .map(|entry| entry.key().clone());
 
-        let path = oldest.ok_or_else(|| {
-            AppError::Internal("No projects to evict".into())
-        })?;
+        let path = oldest.ok_or_else(|| AppError::Internal("No projects to evict".into()))?;
 
         info!("Evicting project: {}", path.display());
 
@@ -247,7 +254,11 @@ impl AppState {
         if let Some(ref cache) = self.inner.cache {
             let workspace_id = path.to_string_lossy().to_string();
             if let Err(e) = cache.clear_workspace(&workspace_id) {
-                tracing::warn!("Failed to clear cache manifest for {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to clear cache manifest for {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
 
@@ -255,7 +266,9 @@ impl AppState {
         self.inner.projects.remove(&path);
 
         // Remove all sessions attached to this project
-        self.inner.sessions.retain(|_, session| session.project_path != path);
+        self.inner
+            .sessions
+            .retain(|_, session| session.project_path != path);
 
         Ok(())
     }
@@ -379,13 +392,10 @@ mod tests {
         tx.send(true).unwrap();
 
         // The wait task should resolve now
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            wait_handle,
-        )
-        .await
-        .expect("wait_handle should resolve after signalling")
-        .expect("join error");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), wait_handle)
+            .await
+            .expect("wait_handle should resolve after signalling")
+            .expect("join error");
 
         assert!(result);
     }

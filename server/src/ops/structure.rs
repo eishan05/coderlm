@@ -35,11 +35,7 @@ pub fn get_structure(file_tree: &Arc<FileTree>, depth: usize) -> StructureRespon
     }
 }
 
-pub fn define_file(
-    file_tree: &Arc<FileTree>,
-    file: &str,
-    definition: &str,
-) -> Result<(), String> {
+pub fn define_file(file_tree: &Arc<FileTree>, file: &str, definition: &str) -> Result<(), String> {
     if let Some(mut entry) = file_tree.files.get_mut(file) {
         if entry.definition.is_some() {
             return Err(format!(
@@ -67,11 +63,7 @@ pub fn redefine_file(
     }
 }
 
-pub fn mark_file(
-    file_tree: &Arc<FileTree>,
-    file: &str,
-    mark_str: &str,
-) -> Result<(), String> {
+pub fn mark_file(file_tree: &Arc<FileTree>, file: &str, mark_str: &str) -> Result<(), String> {
     let mark = FileMark::from_str(mark_str)
         .ok_or_else(|| format!("Unknown mark type: '{}'. Valid: documentation, ignore, test, config, generated, custom", mark_str))?;
 

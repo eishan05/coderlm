@@ -2,7 +2,11 @@ use crate::server::session::HistoryEntry;
 use crate::server::state::AppState;
 use serde::Serialize;
 
-pub fn get_history(state: &AppState, session_id: &str, limit: usize) -> Result<Vec<HistoryEntry>, String> {
+pub fn get_history(
+    state: &AppState,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<HistoryEntry>, String> {
     let session = state
         .inner
         .sessions

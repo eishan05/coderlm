@@ -12,7 +12,7 @@ Usage:
   python3 coderlm_cli.py search QUERY [--offset N] [--limit N]
   python3 coderlm_cli.py impl SYMBOL --file FILE [--line N]
   python3 coderlm_cli.py batch-impl SYMBOL:FILE [SYMBOL:FILE:LINE ...]
-  python3 coderlm_cli.py callers SYMBOL --file FILE [--limit N] [--line N]
+  python3 coderlm_cli.py callers SYMBOL --file FILE [--limit N] [--line N] [--include-path PATH ...] [--exclude-path PATH ...]
   python3 coderlm_cli.py batch-callers SYMBOL:FILE [SYMBOL:FILE:LINE ...] [--limit N]
   python3 coderlm_cli.py tests SYMBOL --file FILE [--limit N] [--line N]
   python3 coderlm_cli.py variables FUNCTION --file FILE [--line N]
@@ -130,7 +130,7 @@ def _get(state: dict, path: str, params: dict | None = None) -> dict:
     if params:
         clean = {k: v for k, v in params.items() if v is not None}
         if clean:
-            url += "?" + urllib.parse.urlencode(clean)
+            url += "?" + urllib.parse.urlencode(clean, doseq=True)
     return _request("GET", url, headers={"X-Session-Id": _session_id(state)})
 
 
@@ -280,6 +280,10 @@ def cmd_callers(args: argparse.Namespace) -> None:
         params["limit"] = args.limit
     if getattr(args, "line", None) is not None:
         params["line"] = args.line
+    if args.include_paths:
+        params["include_paths"] = ",".join(args.include_paths)
+    if args.exclude_paths:
+        params["exclude_paths"] = ",".join(args.exclude_paths)
     _output(_get(state, "/symbols/callers", params))
 
 
@@ -575,6 +579,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_callers.add_argument("--file", required=True, help="File containing the symbol")
     p_callers.add_argument("--limit", type=int, default=None)
     p_callers.add_argument("--line", type=int, default=None, help="Line number to disambiguate same-named symbols")
+    p_callers.add_argument(
+        "--include-path",
+        dest="include_paths",
+        action="append",
+        help="Restrict callers to relative-path prefixes; repeat to add more scopes",
+    )
+    p_callers.add_argument(
+        "--exclude-path",
+        dest="exclude_paths",
+        action="append",
+        help="Exclude relative-path prefixes from caller search; repeat to add more exclusions",
+    )
     p_callers.set_defaults(func=cmd_callers)
 
     # batch-impl
@@ -686,7 +702,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # dependents
     p_dependents = sub.add_parser("dependents", help="Show files that import from a given module")
-    p_dependents.add_argument("file", help="Module/file path to search for (substring match)")
+    p_dependents.add_argument(
+        "file",
+        help="Module/file path to search for; slash paths are normalized (clients/clob -> clients.clob)",
+    )
     p_dependents.set_defaults(func=cmd_dependents)
 
     # ready

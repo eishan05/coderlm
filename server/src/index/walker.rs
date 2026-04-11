@@ -118,8 +118,14 @@ mod tests {
         let count = scan_directory(dir.path(), &file_tree, 100).unwrap();
 
         // Both files should be in the tree
-        assert!(file_tree.get("small.rs").is_some(), "small file should be in tree");
-        assert!(file_tree.get("big.rs").is_some(), "oversized file should be in tree");
+        assert!(
+            file_tree.get("small.rs").is_some(),
+            "small file should be in tree"
+        );
+        assert!(
+            file_tree.get("big.rs").is_some(),
+            "oversized file should be in tree"
+        );
 
         // Count should include both files
         assert_eq!(count, 2);
@@ -139,7 +145,10 @@ mod tests {
         scan_directory(dir.path(), &file_tree, 100).unwrap();
 
         let small_entry = file_tree.get("small.rs").unwrap();
-        assert!(!small_entry.oversized, "small file should not be flagged oversized");
+        assert!(
+            !small_entry.oversized,
+            "small file should not be flagged oversized"
+        );
 
         let big_entry = file_tree.get("big.rs").unwrap();
         assert!(big_entry.oversized, "oversized file should be flagged");
@@ -170,7 +179,10 @@ mod tests {
         scan_directory(dir.path(), &file_tree, 100).unwrap();
 
         let entry = file_tree.get("exact.rs").unwrap();
-        assert!(!entry.oversized, "file exactly at limit should not be flagged oversized");
+        assert!(
+            !entry.oversized,
+            "file exactly at limit should not be flagged oversized"
+        );
     }
 
     // ---- Tests for .coderlmignore support ----
@@ -182,7 +194,8 @@ mod tests {
         std::fs::write(
             dir.path().join(config::CODERLM_IGNORE_FILENAME),
             "generated/\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create files: one inside generated/, one outside
         let gen_dir = dir.path().join("generated");
@@ -193,9 +206,14 @@ mod tests {
         let file_tree = Arc::new(FileTree::new());
         scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
 
-        assert!(file_tree.get("src.rs").is_some(), "Non-ignored file should be indexed");
-        assert!(file_tree.get("generated/proto.rs").is_none(),
-            "File in .coderlmignore'd directory should not be indexed");
+        assert!(
+            file_tree.get("src.rs").is_some(),
+            "Non-ignored file should be indexed"
+        );
+        assert!(
+            file_tree.get("generated/proto.rs").is_none(),
+            "File in .coderlmignore'd directory should not be indexed"
+        );
     }
 
     #[test]
@@ -204,7 +222,8 @@ mod tests {
         std::fs::write(
             dir.path().join(config::CODERLM_IGNORE_FILENAME),
             "*.pb.go\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         std::fs::write(dir.path().join("service.pb.go"), "package api").unwrap();
         std::fs::write(dir.path().join("service.go"), "package api").unwrap();
@@ -212,9 +231,14 @@ mod tests {
         let file_tree = Arc::new(FileTree::new());
         scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
 
-        assert!(file_tree.get("service.go").is_some(), "Non-matching file should be indexed");
-        assert!(file_tree.get("service.pb.go").is_none(),
-            "File matching .coderlmignore glob should not be indexed");
+        assert!(
+            file_tree.get("service.go").is_some(),
+            "Non-matching file should be indexed"
+        );
+        assert!(
+            file_tree.get("service.pb.go").is_none(),
+            "File matching .coderlmignore glob should not be indexed"
+        );
     }
 
     #[test]
@@ -224,7 +248,8 @@ mod tests {
         std::fs::write(
             dir.path().join(config::CODERLM_IGNORE_FILENAME),
             "*.snap\n!important.snap\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         std::fs::write(dir.path().join("important.snap"), "keep this").unwrap();
         std::fs::write(dir.path().join("junk.snap"), "discard this").unwrap();
@@ -233,12 +258,18 @@ mod tests {
         let file_tree = Arc::new(FileTree::new());
         scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
 
-        assert!(file_tree.get("important.snap").is_some(),
-            "Negated file should be indexed");
-        assert!(file_tree.get("junk.snap").is_none(),
-            "Non-negated file matching ignore glob should not be indexed");
-        assert!(file_tree.get("lib.rs").is_some(),
-            "Unrelated file should be indexed");
+        assert!(
+            file_tree.get("important.snap").is_some(),
+            "Negated file should be indexed"
+        );
+        assert!(
+            file_tree.get("junk.snap").is_none(),
+            "Non-negated file matching ignore glob should not be indexed"
+        );
+        assert!(
+            file_tree.get("lib.rs").is_some(),
+            "Unrelated file should be indexed"
+        );
     }
 
     #[test]
@@ -255,8 +286,10 @@ mod tests {
         scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
 
         assert!(file_tree.get("src.rs").is_some());
-        assert!(file_tree.get("mydir/file.rs").is_some(),
-            "Without .coderlmignore all non-gitignored files should be indexed");
+        assert!(
+            file_tree.get("mydir/file.rs").is_some(),
+            "Without .coderlmignore all non-gitignored files should be indexed"
+        );
     }
 
     #[test]
@@ -265,7 +298,8 @@ mod tests {
         std::fs::write(
             dir.path().join(config::CODERLM_IGNORE_FILENAME),
             "# Comment line\nfixtures/\n*.snap\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let fixtures_dir = dir.path().join("fixtures");
         std::fs::create_dir_all(&fixtures_dir).unwrap();
@@ -276,11 +310,18 @@ mod tests {
         let file_tree = Arc::new(FileTree::new());
         scan_directory(dir.path(), &file_tree, 1_000_000).unwrap();
 
-        assert!(file_tree.get("lib.rs").is_some(), "Normal file should be indexed");
-        assert!(file_tree.get("fixtures/data.json").is_none(),
-            "File in ignored directory should not be indexed");
-        assert!(file_tree.get("output.snap").is_none(),
-            "File matching ignored glob should not be indexed");
+        assert!(
+            file_tree.get("lib.rs").is_some(),
+            "Normal file should be indexed"
+        );
+        assert!(
+            file_tree.get("fixtures/data.json").is_none(),
+            "File in ignored directory should not be indexed"
+        );
+        assert!(
+            file_tree.get("output.snap").is_none(),
+            "File matching ignored glob should not be indexed"
+        );
     }
 
     #[test]
@@ -294,11 +335,8 @@ mod tests {
         //  is that the entry IS a symlink)
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(
-                dir.path().join("real.rs"),
-                dir.path().join("link.rs"),
-            )
-            .unwrap();
+            std::os::unix::fs::symlink(dir.path().join("real.rs"), dir.path().join("link.rs"))
+                .unwrap();
         }
 
         let file_tree = Arc::new(FileTree::new());

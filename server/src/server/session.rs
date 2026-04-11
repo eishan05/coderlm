@@ -52,13 +52,15 @@ impl SessionStats {
     pub fn record_peek(&self, chars_served: u64, full_file_chars: u64) {
         self.peek_reads.fetch_add(1, Ordering::Relaxed);
         self.chars_served.fetch_add(chars_served, Ordering::Relaxed);
-        self.chars_full_file.fetch_add(full_file_chars, Ordering::Relaxed);
+        self.chars_full_file
+            .fetch_add(full_file_chars, Ordering::Relaxed);
     }
 
     pub fn record_impl(&self, chars_served: u64, full_file_chars: u64) {
         self.impl_reads.fetch_add(1, Ordering::Relaxed);
         self.chars_served.fetch_add(chars_served, Ordering::Relaxed);
-        self.chars_full_file.fetch_add(full_file_chars, Ordering::Relaxed);
+        self.chars_full_file
+            .fetch_add(full_file_chars, Ordering::Relaxed);
     }
 
     pub fn record_grep(&self) {
@@ -115,12 +117,18 @@ impl Clone for SessionStats {
 impl std::fmt::Debug for SessionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStats")
-            .field("symbol_lookups", &self.symbol_lookups.load(Ordering::Relaxed))
+            .field(
+                "symbol_lookups",
+                &self.symbol_lookups.load(Ordering::Relaxed),
+            )
             .field("peek_reads", &self.peek_reads.load(Ordering::Relaxed))
             .field("impl_reads", &self.impl_reads.load(Ordering::Relaxed))
             .field("grep_ops", &self.grep_ops.load(Ordering::Relaxed))
             .field("chars_served", &self.chars_served.load(Ordering::Relaxed))
-            .field("chars_full_file", &self.chars_full_file.load(Ordering::Relaxed))
+            .field(
+                "chars_full_file",
+                &self.chars_full_file.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }

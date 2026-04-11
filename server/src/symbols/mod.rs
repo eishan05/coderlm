@@ -115,7 +115,9 @@ impl SymbolTable {
                 .symbols
                 .get(&key)
                 .map(|r| r.value().clone())
-                .ok_or_else(|| format!("Symbol '{}' not found in '{}' at line {}", name, file, line));
+                .ok_or_else(|| {
+                    format!("Symbol '{}' not found in '{}' at line {}", name, file, line)
+                });
         }
 
         let matches = self.find_by_file_and_name(file, name);
@@ -123,11 +125,15 @@ impl SymbolTable {
             0 => Err(format!("Symbol '{}' not found in '{}'", name, file)),
             1 => Ok(matches.into_iter().next().unwrap()),
             n => {
-                let lines: Vec<String> = matches.iter().map(|s| s.line_range.0.to_string()).collect();
+                let lines: Vec<String> =
+                    matches.iter().map(|s| s.line_range.0.to_string()).collect();
                 Err(format!(
                     "Symbol '{}' is ambiguous in '{}' ({} matches at lines {}). \
                      Pass line= to disambiguate.",
-                    name, file, n, lines.join(", ")
+                    name,
+                    file,
+                    n,
+                    lines.join(", ")
                 ))
             }
         }
@@ -273,9 +279,9 @@ impl ImportTable {
             .unwrap_or_default()
     }
 
-    /// Find files that import any source containing the given substring.
-    /// This enables fuzzy lookups like searching for "utils" to find files
-    /// importing "./utils", "../utils", "project/utils", etc.
+    /// Find files that import any raw source containing the given substring.
+    ///
+    /// Higher-level ops add module-path normalization for file-like queries.
     pub fn get_dependents(&self, query: &str) -> Vec<String> {
         let mut result_set = HashSet::new();
         for entry in self.by_source.iter() {
@@ -681,8 +687,14 @@ mod tests {
         table.insert_file_imports(
             "src/main.py",
             vec![
-                ImportEntry { source: "os".to_string(), line: 1 },
-                ImportEntry { source: "sys".to_string(), line: 2 },
+                ImportEntry {
+                    source: "os".to_string(),
+                    line: 1,
+                },
+                ImportEntry {
+                    source: "sys".to_string(),
+                    line: 2,
+                },
             ],
         );
 
@@ -704,15 +716,24 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/a.py",
-            vec![ImportEntry { source: "utils".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "utils".to_string(),
+                line: 1,
+            }],
         );
         table.insert_file_imports(
             "src/b.py",
-            vec![ImportEntry { source: "utils".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "utils".to_string(),
+                line: 1,
+            }],
         );
         table.insert_file_imports(
             "src/c.py",
-            vec![ImportEntry { source: "other".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "other".to_string(),
+                line: 1,
+            }],
         );
 
         let dependents = table.get_dependents_exact("utils");
@@ -726,11 +747,17 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/a.ts",
-            vec![ImportEntry { source: "./utils/helpers".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "./utils/helpers".to_string(),
+                line: 1,
+            }],
         );
         table.insert_file_imports(
             "src/b.ts",
-            vec![ImportEntry { source: "../utils".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "../utils".to_string(),
+                line: 1,
+            }],
         );
 
         let dependents = table.get_dependents("utils");
@@ -742,11 +769,17 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/a.py",
-            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "os".to_string(),
+                line: 1,
+            }],
         );
         table.insert_file_imports(
             "src/b.py",
-            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "os".to_string(),
+                line: 1,
+            }],
         );
 
         table.remove_file("src/a.py");
@@ -765,7 +798,10 @@ mod tests {
         let table = ImportTable::new();
         table.insert_file_imports(
             "src/a.py",
-            vec![ImportEntry { source: "unique_module".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "unique_module".to_string(),
+                line: 1,
+            }],
         );
 
         table.remove_file("src/a.py");
@@ -782,7 +818,10 @@ mod tests {
         // First insert
         table.insert_file_imports(
             "src/main.py",
-            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "os".to_string(),
+                line: 1,
+            }],
         );
         assert_eq!(table.get_imports("src/main.py").len(), 1);
         assert_eq!(table.get_dependents_exact("os").len(), 1);
@@ -790,7 +829,10 @@ mod tests {
         // Replace with new imports
         table.insert_file_imports(
             "src/main.py",
-            vec![ImportEntry { source: "sys".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "sys".to_string(),
+                line: 1,
+            }],
         );
 
         // Old import "os" should be gone from reverse index
@@ -812,13 +854,22 @@ mod tests {
         table.insert_file_imports(
             "src/a.py",
             vec![
-                ImportEntry { source: "os".to_string(), line: 1 },
-                ImportEntry { source: "sys".to_string(), line: 2 },
+                ImportEntry {
+                    source: "os".to_string(),
+                    line: 1,
+                },
+                ImportEntry {
+                    source: "sys".to_string(),
+                    line: 2,
+                },
             ],
         );
         table.insert_file_imports(
             "src/b.py",
-            vec![ImportEntry { source: "os".to_string(), line: 1 }],
+            vec![ImportEntry {
+                source: "os".to_string(),
+                line: 1,
+            }],
         );
 
         assert_eq!(table.file_count(), 2);

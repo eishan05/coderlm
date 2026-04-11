@@ -62,8 +62,13 @@ impl Language {
     pub fn has_tree_sitter_support(&self) -> bool {
         matches!(
             self,
-            Language::Rust | Language::Python | Language::TypeScript | Language::JavaScript | Language::Go
-            | Language::Java | Language::Scala
+            Language::Rust
+                | Language::Python
+                | Language::TypeScript
+                | Language::JavaScript
+                | Language::Go
+                | Language::Java
+                | Language::Scala
         )
     }
 

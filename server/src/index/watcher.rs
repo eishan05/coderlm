@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::gitignore::Gitignore;
-use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +24,7 @@ enum WatcherEvent {
         abs_path: PathBuf,
     },
     /// A file was deleted.
-    Deleted {
-        rel_path: String,
-    },
+    Deleted { rel_path: String },
 }
 
 /// Start the filesystem watcher. Returns a handle that keeps the watcher alive.
@@ -56,7 +54,14 @@ pub fn start_watcher(
 
     // Spawn the async processor that drains the channel and handles events.
     let rt = tokio::runtime::Handle::current();
-    rt.spawn(process_events(rx, file_tree.clone(), symbol_table.clone(), import_table.clone(), max_file_size, coderlm_ignore));
+    rt.spawn(process_events(
+        rx,
+        file_tree.clone(),
+        symbol_table.clone(),
+        import_table.clone(),
+        max_file_size,
+        coderlm_ignore,
+    ));
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(500),
@@ -168,7 +173,11 @@ async fn process_events(
     while let Some(events) = rx.recv().await {
         for event in events {
             match event {
-                WatcherEvent::Changed { root, rel_path, abs_path } => {
+                WatcherEvent::Changed {
+                    root,
+                    rel_path,
+                    abs_path,
+                } => {
                     handle_file_change(
                         &root,
                         &file_tree,
@@ -178,7 +187,8 @@ async fn process_events(
                         &coderlm_ignore,
                         &rel_path,
                         &abs_path,
-                    ).await;
+                    )
+                    .await;
                 }
                 WatcherEvent::Deleted { rel_path } => {
                     handle_file_delete(&file_tree, &symbol_table, &import_table, &rel_path);
@@ -280,7 +290,9 @@ async fn handle_file_change(
                     debug!("Failed to re-extract imports from {}: {}", rel_path, e);
                 }
             }
-        }).await.unwrap_or_else(|e| {
+        })
+        .await
+        .unwrap_or_else(|e| {
             warn!("Symbol extraction task panicked: {}", e);
         });
     }
@@ -392,7 +404,10 @@ mod tests {
         }];
 
         let result = collect_events(&root, 1024 * 1024, &empty_ignore(), events);
-        assert!(result.is_empty(), "Events in ignored dirs should be skipped");
+        assert!(
+            result.is_empty(),
+            "Events in ignored dirs should be skipped"
+        );
     }
 
     #[test]
@@ -443,7 +458,8 @@ mod tests {
             &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
-        ).await;
+        )
+        .await;
 
         // File tree should have the entry
         let entry = file_tree.get("src/lib.rs").expect("File should be in tree");
@@ -454,7 +470,11 @@ mod tests {
     #[tokio::test]
     async fn test_handle_file_change_extracts_symbols() {
         let (_dir, root) = setup_test_dir();
-        create_rust_file(&root, "src/lib.rs", "pub fn hello_world() {}\npub fn goodbye() {}");
+        create_rust_file(
+            &root,
+            "src/lib.rs",
+            "pub fn hello_world() {}\npub fn goodbye() {}",
+        );
 
         let file_tree = Arc::new(FileTree::new());
         let symbol_table = Arc::new(SymbolTable::new());
@@ -469,14 +489,22 @@ mod tests {
             &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
-        ).await;
+        )
+        .await;
 
         // Symbols should have been extracted
         let entry = file_tree.get("src/lib.rs").unwrap();
-        assert!(entry.symbols_extracted, "Symbols should be marked as extracted");
+        assert!(
+            entry.symbols_extracted,
+            "Symbols should be marked as extracted"
+        );
 
         let syms = symbol_table.list_by_file("src/lib.rs");
-        assert!(syms.len() >= 2, "Expected at least 2 symbols, got {}", syms.len());
+        assert!(
+            syms.len() >= 2,
+            "Expected at least 2 symbols, got {}",
+            syms.len()
+        );
     }
 
     #[tokio::test]
@@ -498,11 +526,15 @@ mod tests {
             &empty_ignore(),
             "big.rs",
             &root.join("big.rs"),
-        ).await;
+        )
+        .await;
 
         let entry = file_tree.get("big.rs").unwrap();
         assert!(entry.oversized, "File should be marked oversized");
-        assert!(!entry.symbols_extracted, "Oversized file should not have symbols extracted");
+        assert!(
+            !entry.symbols_extracted,
+            "Oversized file should not have symbols extracted"
+        );
         assert_eq!(symbol_table.list_by_file("big.rs").len(), 0);
     }
 
@@ -525,7 +557,8 @@ mod tests {
             &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
-        ).await;
+        )
+        .await;
 
         let syms = symbol_table.list_by_file("src/lib.rs");
         assert_eq!(syms.len(), 1);
@@ -544,7 +577,8 @@ mod tests {
             &empty_ignore(),
             "src/lib.rs",
             &root.join("src/lib.rs"),
-        ).await;
+        )
+        .await;
 
         let syms = symbol_table.list_by_file("src/lib.rs");
         assert_eq!(syms.len(), 2, "Old symbol 'alpha' should have been removed");
@@ -618,7 +652,14 @@ mod tests {
         let ft = file_tree.clone();
         let st = symbol_table.clone();
         let it = import_table.clone();
-        let handle = tokio::spawn(process_events(rx, ft, st, it, 1024 * 1024, Arc::new(empty_ignore())));
+        let handle = tokio::spawn(process_events(
+            rx,
+            ft,
+            st,
+            it,
+            1024 * 1024,
+            Arc::new(empty_ignore()),
+        ));
 
         // Send a batch with one Changed and one Deleted event
         tx.send(vec![
@@ -630,7 +671,9 @@ mod tests {
             WatcherEvent::Deleted {
                 rel_path: "src/b.rs".to_string(),
             },
-        ]).await.unwrap();
+        ])
+        .await
+        .unwrap();
 
         // Drop sender to signal the processor to exit
         drop(tx);
@@ -657,13 +700,17 @@ mod tests {
         for _ in 0..10 {
             tx.try_send(vec![WatcherEvent::Deleted {
                 rel_path: "foo.rs".to_string(),
-            }]).unwrap();
+            }])
+            .unwrap();
         }
 
         let elapsed = start.elapsed();
         // Sending 10 events through the channel should be nearly instant
-        assert!(elapsed < Duration::from_millis(10),
-            "Channel send should be non-blocking, took {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "Channel send should be non-blocking, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -695,11 +742,14 @@ mod tests {
             &empty_ignore(),
             "image.png",
             &abs,
-        ).await;
+        )
+        .await;
 
         // Should not be added to the file tree since it's extension-ignored
-        assert!(file_tree.get("image.png").is_none(),
-            "Extension-ignored files should not be added to file tree");
+        assert!(
+            file_tree.get("image.png").is_none(),
+            "Extension-ignored files should not be added to file tree"
+        );
     }
 
     // ---- Tests for .coderlmignore support ----
@@ -725,7 +775,10 @@ mod tests {
         }];
 
         let result = collect_events(&root, 1024 * 1024, &gi, events);
-        assert!(result.is_empty(), "Files matching .coderlmignore should be skipped");
+        assert!(
+            result.is_empty(),
+            "Files matching .coderlmignore should be skipped"
+        );
     }
 
     #[test]
@@ -757,7 +810,10 @@ mod tests {
         }];
 
         let result = collect_events(&root, 1024 * 1024, &gi, events);
-        assert!(result.is_empty(), "Glob patterns in .coderlmignore should work");
+        assert!(
+            result.is_empty(),
+            "Glob patterns in .coderlmignore should work"
+        );
     }
 
     #[test]
@@ -809,12 +865,18 @@ mod tests {
             &gi,
             "generated/proto.rs",
             &root.join("generated/proto.rs"),
-        ).await;
+        )
+        .await;
 
-        assert!(file_tree.get("generated/proto.rs").is_none(),
-            "Files matching .coderlmignore should not be added to file tree");
-        assert_eq!(symbol_table.list_by_file("generated/proto.rs").len(), 0,
-            "Symbols should not be extracted for .coderlmignore'd files");
+        assert!(
+            file_tree.get("generated/proto.rs").is_none(),
+            "Files matching .coderlmignore should not be added to file tree"
+        );
+        assert_eq!(
+            symbol_table.list_by_file("generated/proto.rs").len(),
+            0,
+            "Symbols should not be extracted for .coderlmignore'd files"
+        );
     }
 
     #[tokio::test]
@@ -836,10 +898,13 @@ mod tests {
             &gi,
             "src/lib.rs",
             &root.join("src/lib.rs"),
-        ).await;
+        )
+        .await;
 
-        assert!(file_tree.get("src/lib.rs").is_some(),
-            "Non-ignored files should still be indexed");
+        assert!(
+            file_tree.get("src/lib.rs").is_some(),
+            "Non-ignored files should still be indexed"
+        );
     }
 
     #[test]
@@ -847,13 +912,19 @@ mod tests {
         let (_dir, root) = setup_test_dir();
         // No .coderlmignore file created
         let gi = config::load_coderlm_ignore(&root);
-        assert!(gi.is_empty(), "Missing .coderlmignore should produce empty matcher");
+        assert!(
+            gi.is_empty(),
+            "Missing .coderlmignore should produce empty matcher"
+        );
     }
 
     #[test]
     fn test_load_coderlm_ignore_with_file() {
         let (_dir, root) = setup_test_dir();
         let gi = create_coderlmignore(&root, "vendor/\n*.pb.go\n");
-        assert!(!gi.is_empty(), "Non-empty .coderlmignore should produce non-empty matcher");
+        assert!(
+            !gi.is_empty(),
+            "Non-empty .coderlmignore should produce non-empty matcher"
+        );
     }
 }

@@ -20,7 +20,10 @@ pub fn cache_dir() -> PathBuf {
 
 fn dirs_cache_macos() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join("Library").join("Caches").join("coderlm")
+    PathBuf::from(home)
+        .join("Library")
+        .join("Caches")
+        .join("coderlm")
 }
 
 #[allow(dead_code)]
@@ -52,18 +55,14 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
     // Check schema version and migrate if needed.
     // user_version is a SQLite pragma that persists an integer in the DB file.
-    let current_version: i64 = conn.query_row(
-        "PRAGMA user_version",
-        [],
-        |row| row.get(0),
-    )?;
+    let current_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
     if current_version != CACHE_SCHEMA_VERSION {
         // Schema changed — drop everything and recreate.
         // This is safe because the cache is fully reconstructable from source files.
         conn.execute_batch(
             "DROP TABLE IF EXISTS file_index;
-             DROP TABLE IF EXISTS workspace_manifest;"
+             DROP TABLE IF EXISTS workspace_manifest;",
         )?;
     }
 
@@ -88,7 +87,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             file_size INTEGER NOT NULL,
             last_seen_at TIMESTAMP NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (workspace_id, rel_path)
-        );"
+        );",
     )?;
 
     // Set the schema version so future opens know we're current
@@ -115,7 +114,9 @@ mod tests {
 
         // Verify workspace_manifest table exists
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM workspace_manifest", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM workspace_manifest", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -230,7 +231,9 @@ mod tests {
         ).unwrap();
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM workspace_manifest", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM workspace_manifest", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 2);
     }
@@ -252,7 +255,10 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
             rusqlite::params!["/project", "src/main.rs", "hash2", 200_i64, 60_i64],
         );
-        assert!(result.is_err(), "Duplicate workspace_id + rel_path should fail");
+        assert!(
+            result.is_err(),
+            "Duplicate workspace_id + rel_path should fail"
+        );
     }
 
     #[test]
@@ -277,7 +283,10 @@ mod tests {
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(mode, "wal", "WAL mode should be enabled for concurrent reads");
+        assert_eq!(
+            mode, "wal",
+            "WAL mode should be enabled for concurrent reads"
+        );
     }
 
     #[test]
@@ -298,13 +307,15 @@ mod tests {
                     symbol_schema_version INTEGER NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT (datetime('now'))
                 );
-                PRAGMA user_version = 1;"  // old version
-            ).unwrap();
+                PRAGMA user_version = 1;", // old version
+            )
+            .unwrap();
             // Insert data that should be dropped on migration
             conn.execute(
                 "INSERT INTO file_index VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
                 rusqlite::params!["old_hash", "rust", "[]", 1, "v1", 1],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Open with open_db — should detect version mismatch and recreate
@@ -314,23 +325,31 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM file_index", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0, "Old data should be cleared after schema migration");
+        assert_eq!(
+            count, 0,
+            "Old data should be cleared after schema migration"
+        );
 
         // New schema should have composite PK — verify by inserting same hash
         // with different languages (would fail on old single-column PK)
         conn.execute(
             "INSERT INTO file_index VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
             rusqlite::params!["same_hash", "rust", "[]", 1, "v1", 1],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO file_index VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
             rusqlite::params!["same_hash", "python", "[]", 1, "v1", 1],
-        ).unwrap();
+        )
+        .unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM file_index", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 2, "New schema should allow same hash with different languages");
+        assert_eq!(
+            count, 2,
+            "New schema should allow same hash with different languages"
+        );
     }
 
     #[test]

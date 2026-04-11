@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -26,7 +26,8 @@ use crate::server::state::{AppState, Project};
 /// Parameters for `coderlm_callers` — find callers of a symbol.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CallersParams {
-    /// Symbol name to find callers of.
+    /// Symbol name to find callers of. May be a bare name (`"method"`) or a
+    /// qualified name (`"ClassName.method"`) to target a specific class method.
     pub symbol: String,
     /// Relative path to the file containing the symbol definition.
     pub file: String,
@@ -36,6 +37,14 @@ pub struct CallersParams {
     /// Optional line number to disambiguate same-named symbols in the same file.
     #[serde(default)]
     pub line: Option<usize>,
+    /// Optional list of path prefixes to restrict the search to. Only files
+    /// whose relative path starts with one of these prefixes will be scanned.
+    #[serde(default)]
+    pub include_paths: Option<Vec<String>>,
+    /// Optional list of path prefixes to exclude from the search. Files whose
+    /// relative path starts with any of these prefixes will be skipped.
+    #[serde(default)]
+    pub exclude_paths: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,9 +110,15 @@ impl CoderlmMcpServer {
         name = "coderlm_callers",
         annotations(read_only_hint = true, title = "Find Callers")
     )]
-    pub fn coderlm_callers(&self, params: Parameters<CallersParams>) -> String {
+    pub async fn coderlm_callers(&self, params: Parameters<CallersParams>) -> String {
+        // Wait for initial indexing to complete so we don't return false
+        // "not found" errors when the symbol table hasn't been populated yet.
+        self.project.wait_until_indexed().await;
+
         let p = &params.0;
         let limit = p.limit.unwrap_or(50);
+        let include_refs = p.include_paths.as_deref();
+        let exclude_refs = p.exclude_paths.as_deref();
         match symbol_ops::find_callers(
             &self.project().root,
             &self.project().file_tree,
@@ -112,6 +127,8 @@ impl CoderlmMcpServer {
             &p.file,
             limit,
             p.line,
+            include_refs,
+            exclude_refs,
         ) {
             Ok(callers) => serde_json::to_string_pretty(&serde_json::json!({
                 "callers": callers,
@@ -122,7 +139,6 @@ impl CoderlmMcpServer {
             Err(e) => format!("Error: {}", e),
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------

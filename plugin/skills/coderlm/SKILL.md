@@ -82,10 +82,16 @@ cli variables function_name --file path   # Local variables inside a function
 
 ```bash
 cli callers function_name --file path     # Every call site: file, line, calling code
+cli callers function_name --file path --include-path tests/
+cli callers function_name --file path --exclude-path docs/
+cli dependents clients/clob              # Files importing a matching module
 cli tests function_name --file path       # Tests referencing this symbol
 ```
 
 These search the entire indexed codebase, not just files you've already seen.
+`dependents` uses raw import substring matching plus normalized module candidates, so `clients/clob` can match `xanbot_polymarket.clients.clob`.
+Use `--include-path` / `--exclude-path` when you need caller lookup restricted to
+specific directories or files.
 
 ### Annotating
 

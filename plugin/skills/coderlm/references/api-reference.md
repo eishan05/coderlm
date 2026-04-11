@@ -49,9 +49,16 @@ python3 cli impl run_server --file src/main.rs [--line 69]
 
 # Find call sites
 python3 cli callers scan_directory --file src/index/walker.rs [--limit 50] [--line 15]
+python3 cli callers scan_directory --file src/index/walker.rs --include-path tests/
+python3 cli callers scan_directory --file src/index/walker.rs --exclude-path docs/
 
 # Find tests referencing a symbol
 python3 cli tests scan_directory --file src/index/walker.rs [--limit 20] [--line 15]
+
+# Find files importing a matching module or file path.
+# Raw import substrings and normalized candidates are searched, so
+# "clients/clob" can match "xanbot_polymarket.clients.clob".
+python3 cli dependents clients/clob
 
 # List local variables in a function
 python3 cli variables scan_directory --file src/index/walker.rs [--line 15]

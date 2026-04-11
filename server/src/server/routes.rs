@@ -6,7 +6,7 @@ use axum::http::HeaderMap;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::ops::{annotations, content, history, imports, structure, symbol_ops};
 use crate::server::errors::AppError;
@@ -64,7 +64,13 @@ fn symbol_not_found_or_not_ready(err: String, indexing_complete: bool) -> AppErr
     }
 }
 
-fn record_history(state: &AppState, session_id: Option<&str>, method: &str, path: &str, preview: &str) {
+fn record_history(
+    state: &AppState,
+    session_id: Option<&str>,
+    method: &str,
+    path: &str,
+    preview: &str,
+) {
     if let Some(id) = session_id {
         if let Some(mut session) = state.inner.sessions.get_mut(id) {
             session.record(method, path, preview);
@@ -81,8 +87,24 @@ fn record_symbol_lookup(state: &AppState, session_id: Option<&str>) {
     }
 }
 
+fn split_scope_param(value: Option<&str>) -> Option<Vec<String>> {
+    let parts: Vec<String> = value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
 /// Record a peek operation for telemetry with the chars served vs full file chars.
-fn record_peek_stats(state: &AppState, session_id: Option<&str>, chars_served: u64, full_file_chars: u64) {
+fn record_peek_stats(
+    state: &AppState,
+    session_id: Option<&str>,
+    chars_served: u64,
+    full_file_chars: u64,
+) {
     if let Some(id) = session_id {
         if let Some(session) = state.inner.sessions.get(id) {
             session.stats.record_peek(chars_served, full_file_chars);
@@ -91,7 +113,12 @@ fn record_peek_stats(state: &AppState, session_id: Option<&str>, chars_served: u
 }
 
 /// Record an impl operation for telemetry with the chars served vs full file chars.
-fn record_impl_stats(state: &AppState, session_id: Option<&str>, chars_served: u64, full_file_chars: u64) {
+fn record_impl_stats(
+    state: &AppState,
+    session_id: Option<&str>,
+    chars_served: u64,
+    full_file_chars: u64,
+) {
     if let Some(id) = session_id {
         if let Some(session) = state.inner.sessions.get(id) {
             session.stats.record_impl(chars_served, full_file_chars);
@@ -134,7 +161,10 @@ pub fn build_routes(state: AppState) -> Router {
         .route("/api/v1/symbols/define", post(define_symbol))
         .route("/api/v1/symbols/redefine", post(redefine_symbol))
         .route("/api/v1/symbols/implementation", get(get_implementation))
-        .route("/api/v1/symbols/implementations/batch", post(batch_implementations))
+        .route(
+            "/api/v1/symbols/implementations/batch",
+            post(batch_implementations),
+        )
         .route("/api/v1/symbols/tests", get(find_tests))
         .route("/api/v1/symbols/callers", get(find_callers))
         .route("/api/v1/symbols/callers/batch", post(batch_callers))
@@ -337,7 +367,13 @@ async fn get_structure(
     let depth = params.depth.unwrap_or(0);
     let result = structure::get_structure(&project.file_tree, depth);
     let preview = format!("{} files", result.file_count);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/structure", &preview);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "GET",
+        "/structure",
+        &preview,
+    );
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
 
@@ -355,7 +391,13 @@ async fn define_file(
     let project = require_project(&state, &headers)?;
     structure::define_file(&project.file_tree, &body.file, &body.definition)
         .map_err(AppError::BadRequest)?;
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/structure/define", &body.file);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/structure/define",
+        &body.file,
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -367,7 +409,13 @@ async fn redefine_file(
     let project = require_project(&state, &headers)?;
     structure::redefine_file(&project.file_tree, &body.file, &body.definition)
         .map_err(AppError::BadRequest)?;
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/structure/redefine", &body.file);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/structure/redefine",
+        &body.file,
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -385,7 +433,13 @@ async fn mark_file(
     let project = require_project(&state, &headers)?;
     structure::mark_file(&project.file_tree, &body.file, &body.mark)
         .map_err(AppError::BadRequest)?;
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/structure/mark", &body.file);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/structure/mark",
+        &body.file,
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -416,8 +470,13 @@ async fn symbols_ready(
 
     let ready = project.is_indexing_complete();
     let symbol_count = project.symbol_table.len();
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/symbols/ready",
-        &format!("ready={}, {} symbols", ready, symbol_count));
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "GET",
+        "/symbols/ready",
+        &format!("ready={}, {} symbols", ready, symbol_count),
+    );
     Ok(Json(json!({
         "ready": ready,
         "symbol_count": symbol_count,
@@ -441,7 +500,10 @@ async fn list_symbols(
     // Validate file exists in index when a file filter is provided
     if let Some(ref file) = params.file {
         if project.file_tree.get(file).is_none() {
-            return Err(AppError::NotFound(format!("File '{}' not found in index", file)));
+            return Err(AppError::NotFound(format!(
+                "File '{}' not found in index",
+                file
+            )));
         }
     }
     let kind_filter = match params.kind.as_deref() {
@@ -469,7 +531,9 @@ async fn list_symbols(
     let preview = format!("{} symbols", results.len());
     record_history(&state, sid.as_deref(), "GET", "/symbols", &preview);
     record_symbol_lookup(&state, sid.as_deref());
-    Ok(Json(json!({ "symbols": results, "count": results.len(), "indexing_complete": indexing_complete })))
+    Ok(Json(
+        json!({ "symbols": results, "count": results.len(), "indexing_complete": indexing_complete }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -490,7 +554,12 @@ async fn search_symbols(
     let limit = params.limit.unwrap_or(20);
     let result = symbol_ops::search_symbols(&project.symbol_table, &params.q, offset, limit);
     let sid = session_id(&headers);
-    let preview = format!("{} matches for '{}' (total {})", result.symbols.len(), params.q, result.total);
+    let preview = format!(
+        "{} matches for '{}' (total {})",
+        result.symbols.len(),
+        params.q,
+        result.total
+    );
     record_history(&state, sid.as_deref(), "GET", "/symbols/search", &preview);
     record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({
@@ -526,7 +595,13 @@ async fn define_symbol(
         body.line,
     )
     .map_err(AppError::BadRequest)?;
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/symbols/define", &body.symbol);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/symbols/define",
+        &body.symbol,
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -544,7 +619,13 @@ async fn redefine_symbol(
         body.line,
     )
     .map_err(AppError::BadRequest)?;
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/symbols/redefine", &body.symbol);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/symbols/redefine",
+        &body.symbol,
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -572,13 +653,31 @@ async fn get_implementation(
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let sid = session_id(&headers);
-    let preview = format!("{}::{} ({} bytes)", params.file, params.symbol, impl_result.source.len());
-    record_history(&state, sid.as_deref(), "GET", "/symbols/implementation", &preview);
+    let preview = format!(
+        "{}::{} ({} bytes)",
+        params.file,
+        params.symbol,
+        impl_result.source.len()
+    );
+    record_history(
+        &state,
+        sid.as_deref(),
+        "GET",
+        "/symbols/implementation",
+        &preview,
+    );
     // Track token savings: chars served (impl snippet) vs full file
-    let full_file_chars = project.file_tree.get(&params.file)
+    let full_file_chars = project
+        .file_tree
+        .get(&params.file)
         .map(|e| e.size)
         .unwrap_or(impl_result.source.len() as u64);
-    record_impl_stats(&state, sid.as_deref(), impl_result.source.len() as u64, full_file_chars);
+    record_impl_stats(
+        &state,
+        sid.as_deref(),
+        impl_result.source.len() as u64,
+        full_file_chars,
+    );
     let mut response = json!({
         "symbol": params.symbol,
         "file": params.file,
@@ -617,7 +716,9 @@ async fn batch_implementations(
     Json(body): Json<BatchImplementationRequest>,
 ) -> Result<Json<Value>, AppError> {
     if body.symbols.is_empty() {
-        return Err(AppError::BadRequest("'symbols' array must not be empty".into()));
+        return Err(AppError::BadRequest(
+            "'symbols' array must not be empty".into(),
+        ));
     }
     if body.symbols.len() > 50 {
         return Err(AppError::BadRequest(
@@ -644,7 +745,9 @@ async fn batch_implementations(
         ) {
             Ok(impl_result) => {
                 success_count += 1;
-                let full_file_chars = project.file_tree.get(&sym_ref.file)
+                let full_file_chars = project
+                    .file_tree
+                    .get(&sym_ref.file)
                     .map(|e| e.size)
                     .unwrap_or(impl_result.source.len() as u64);
                 total_chars_served += impl_result.source.len() as u64;
@@ -692,9 +795,18 @@ async fn batch_implementations(
         if let Some(id) = sid.as_deref() {
             if let Some(session) = state.inner.sessions.get(id) {
                 use std::sync::atomic::Ordering;
-                session.stats.impl_reads.fetch_add(success_count as u64, Ordering::Relaxed);
-                session.stats.chars_served.fetch_add(total_chars_served, Ordering::Relaxed);
-                session.stats.chars_full_file.fetch_add(total_chars_full_file, Ordering::Relaxed);
+                session
+                    .stats
+                    .impl_reads
+                    .fetch_add(success_count as u64, Ordering::Relaxed);
+                session
+                    .stats
+                    .chars_served
+                    .fetch_add(total_chars_served, Ordering::Relaxed);
+                session
+                    .stats
+                    .chars_full_file
+                    .fetch_add(total_chars_full_file, Ordering::Relaxed);
             }
         }
     }
@@ -739,7 +851,9 @@ async fn find_tests(
     let preview = format!("{} tests for {}", tests.len(), params.symbol);
     record_history(&state, sid.as_deref(), "GET", "/symbols/tests", &preview);
     record_symbol_lookup(&state, sid.as_deref());
-    Ok(Json(json!({ "tests": tests, "count": tests.len(), "indexing_complete": indexing_complete })))
+    Ok(Json(
+        json!({ "tests": tests, "count": tests.len(), "indexing_complete": indexing_complete }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -749,6 +863,12 @@ struct CallersQuery {
     limit: Option<usize>,
     /// Optional line number to disambiguate same-named symbols in the same file.
     line: Option<usize>,
+    /// Optional relative-path prefixes to include in caller search.
+    #[serde(alias = "include_path")]
+    include_paths: Option<String>,
+    /// Optional relative-path prefixes to exclude from caller search.
+    #[serde(alias = "exclude_path")]
+    exclude_paths: Option<String>,
 }
 
 async fn find_callers(
@@ -757,8 +877,12 @@ async fn find_callers(
     Query(params): Query<CallersQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
+    // Wait for initial indexing so we don't return false "not found" errors.
+    project.wait_until_indexed().await;
     let indexing_complete = project.is_indexing_complete();
     let limit = params.limit.unwrap_or(50);
+    let include_paths = split_scope_param(params.include_paths.as_deref());
+    let exclude_paths = split_scope_param(params.exclude_paths.as_deref());
     let callers = symbol_ops::find_callers(
         &project.root,
         &project.file_tree,
@@ -767,13 +891,17 @@ async fn find_callers(
         &params.file,
         limit,
         params.line,
+        include_paths.as_deref(),
+        exclude_paths.as_deref(),
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let sid = session_id(&headers);
     let preview = format!("{} callers of {}", callers.len(), params.symbol);
     record_history(&state, sid.as_deref(), "GET", "/symbols/callers", &preview);
     record_symbol_lookup(&state, sid.as_deref());
-    Ok(Json(json!({ "callers": callers, "count": callers.len(), "indexing_complete": indexing_complete })))
+    Ok(Json(
+        json!({ "callers": callers, "count": callers.len(), "indexing_complete": indexing_complete }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -800,7 +928,9 @@ async fn batch_callers(
     Json(body): Json<BatchCallersRequest>,
 ) -> Result<Json<Value>, AppError> {
     if body.symbols.is_empty() {
-        return Err(AppError::BadRequest("'symbols' array must not be empty".into()));
+        return Err(AppError::BadRequest(
+            "'symbols' array must not be empty".into(),
+        ));
     }
     if body.symbols.len() > 50 {
         return Err(AppError::BadRequest(
@@ -809,6 +939,8 @@ async fn batch_callers(
     }
 
     let project = require_project(&state, &headers)?;
+    // Wait for initial indexing so we don't return false "not found" errors.
+    project.wait_until_indexed().await;
     let indexing_complete = project.is_indexing_complete();
     let limit = body.limit.unwrap_or(50);
 
@@ -825,6 +957,8 @@ async fn batch_callers(
             &sym_ref.file,
             limit,
             sym_ref.line,
+            None,
+            None,
         ) {
             Ok(callers) => {
                 success_count += 1;
@@ -899,9 +1033,17 @@ async fn list_variables(
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let sid = session_id(&headers);
     let preview = format!("{} variables in {}", vars.len(), params.function);
-    record_history(&state, sid.as_deref(), "GET", "/symbols/variables", &preview);
+    record_history(
+        &state,
+        sid.as_deref(),
+        "GET",
+        "/symbols/variables",
+        &preview,
+    );
     record_symbol_lookup(&state, sid.as_deref());
-    Ok(Json(json!({ "variables": vars, "count": vars.len(), "indexing_complete": indexing_complete })))
+    Ok(Json(
+        json!({ "variables": vars, "count": vars.len(), "indexing_complete": indexing_complete }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -928,7 +1070,11 @@ async fn symbols_outline(
     )
     .map_err(|e| symbol_not_found_or_not_ready(e, indexing_complete))?;
     let sid = session_id(&headers);
-    let preview = format!("outline for {} ({} groups)", params.file, outline.groups.len());
+    let preview = format!(
+        "outline for {} ({} groups)",
+        params.file,
+        outline.groups.len()
+    );
     record_history(&state, sid.as_deref(), "GET", "/symbols/outline", &preview);
     record_symbol_lookup(&state, sid.as_deref());
     Ok(Json(json!({
@@ -959,22 +1105,23 @@ async fn peek(
     let project = require_project(&state, &headers)?;
     let start = params.start.unwrap_or(0);
     let end = params.end.unwrap_or(100);
-    let result = content::peek(
-        &project.root,
-        &project.file_tree,
-        &params.file,
-        start,
-        end,
-    )
-    .map_err(AppError::NotFound)?;
+    let result = content::peek(&project.root, &project.file_tree, &params.file, start, end)
+        .map_err(AppError::NotFound)?;
     let sid = session_id(&headers);
     let preview = format!("{}:{}-{}", params.file, start, end);
     record_history(&state, sid.as_deref(), "GET", "/peek", &preview);
     // Track token savings: chars served (peek content) vs full file
-    let full_file_chars = project.file_tree.get(&params.file)
+    let full_file_chars = project
+        .file_tree
+        .get(&params.file)
         .map(|e| e.size)
         .unwrap_or(result.content.len() as u64);
-    record_peek_stats(&state, sid.as_deref(), result.content.len() as u64, full_file_chars);
+    record_peek_stats(
+        &state,
+        sid.as_deref(),
+        result.content.len() as u64,
+        full_file_chars,
+    );
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
 
@@ -1009,7 +1156,14 @@ async fn grep_handler(
     let pattern = params.pattern.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        content::grep_with_scope(&root, &file_tree, &pattern, max_matches, context_lines, scope)
+        content::grep_with_scope(
+            &root,
+            &file_tree,
+            &pattern,
+            max_matches,
+            context_lines,
+            scope,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
@@ -1046,7 +1200,13 @@ async fn chunk_indices(
     )
     .map_err(AppError::BadRequest)?;
     let preview = format!("{} chunks for {}", result.chunks.len(), params.file);
-    record_history(&state, session_id(&headers).as_deref(), "GET", "/chunk_indices", &preview);
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "GET",
+        "/chunk_indices",
+        &preview,
+    );
     Ok(Json(serde_json::to_value(result).unwrap()))
 }
 
@@ -1070,8 +1230,7 @@ async fn get_history(
     match session_id(&headers) {
         Some(sid) => {
             let _project = state.get_project_for_session(&sid)?;
-            let entries =
-                history::get_history(&state, &sid, limit).map_err(AppError::NotFound)?;
+            let entries = history::get_history(&state, &sid, limit).map_err(AppError::NotFound)?;
             Ok(Json(json!({ "history": entries, "count": entries.len() })))
         }
         None => {
@@ -1093,7 +1252,13 @@ async fn save_annotations(
     let project = require_project(&state, &headers)?;
     annotations::save_annotations(&project.root, &project.file_tree, &project.symbol_table)
         .map_err(AppError::Internal)?;
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/save", "saved");
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/annotations/save",
+        "saved",
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1111,18 +1276,21 @@ async fn load_annotations(
                 .into(),
         ));
     }
-    let data = annotations::load_annotations(
-        &project.root,
-        &project.file_tree,
-        &project.symbol_table,
-    )
-    .map_err(AppError::Internal)?;
+    let data =
+        annotations::load_annotations(&project.root, &project.file_tree, &project.symbol_table)
+            .map_err(AppError::Internal)?;
     let summary = json!({
         "file_definitions": data.file_definitions.len(),
         "file_marks": data.file_marks.len(),
         "symbol_definitions": data.symbol_definitions.len(),
     });
-    record_history(&state, session_id(&headers).as_deref(), "POST", "/annotations/load", "loaded");
+    record_history(
+        &state,
+        session_id(&headers).as_deref(),
+        "POST",
+        "/annotations/load",
+        "loaded",
+    );
     Ok(Json(json!({ "ok": true, "loaded": summary })))
 }
 
@@ -1141,8 +1309,12 @@ async fn get_file_imports(
     Query(params): Query<ImportsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let project = require_project(&state, &headers)?;
-    let result = imports::get_imports(&project.import_table, &params.file, Some(&project.file_tree))
-        .map_err(AppError::NotFound)?;
+    let result = imports::get_imports(
+        &project.import_table,
+        &params.file,
+        Some(&project.file_tree),
+    )
+    .map_err(AppError::NotFound)?;
     record_history(
         &state,
         session_id(&headers).as_deref(),
